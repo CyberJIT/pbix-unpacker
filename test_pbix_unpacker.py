@@ -49,20 +49,22 @@ class TestPbixUnpacker(unittest.TestCase):
         )
 
         # 1st run: all files should be created
-        created, updated, skipped = unpack_single_pbix(pbix_path)
+        created, updated, skipped, errors = unpack_single_pbix(pbix_path)
         self.assertEqual(created, 3)
         self.assertEqual(updated, 0)
         self.assertEqual(skipped, 0)
+        self.assertEqual(errors, 0)
 
         extracted_dir = os.path.join(self.test_dir, "ReportA")
         self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataModel")))
         self.assertTrue(os.path.exists(os.path.join(extracted_dir, "Report", "Layout")))
 
         # 2nd run with unchanged pbix: all should be skipped
-        c2, u2, s2 = unpack_single_pbix(pbix_path)
+        c2, u2, s2, e2 = unpack_single_pbix(pbix_path)
         self.assertEqual(c2, 0)
         self.assertEqual(u2, 0)
         self.assertEqual(s2, 3)
+        self.assertEqual(e2, 0)
 
         # 3rd run: modify one file in pbix, add one file
         self._create_pbix(
@@ -74,13 +76,24 @@ class TestPbixUnpacker(unittest.TestCase):
                 "Metadata/Version": b"1.2.3",          # New
             },
         )
-        c3, u3, s3 = unpack_single_pbix(pbix_path)
+        c3, u3, s3, e3 = unpack_single_pbix(pbix_path)
         self.assertEqual(c3, 1)  # Version created
         self.assertEqual(u3, 1)  # DataModel updated
         self.assertEqual(s3, 2)  # Layout and SecurityBindings skipped
+        self.assertEqual(e3, 0)
 
         with open(os.path.join(extracted_dir, "DataModel"), "rb") as f:
             self.assertEqual(f.read(), b"binary_data_v2_MODIFIED")
+
+    def test_graceful_error_handling(self):
+        # Create a file that is not a valid zip archive
+        corrupted_pbix = os.path.join(self.test_dir, "Corrupted.pbix")
+        with open(corrupted_pbix, "wb") as f:
+            f.write(b"not a valid zip file")
+
+        c, u, s, e = unpack_single_pbix(corrupted_pbix)
+        self.assertEqual(e, 1)
+        self.assertEqual(c, 0)
 
     def test_recursive_discovery_and_pruning(self):
         # Create nested folders

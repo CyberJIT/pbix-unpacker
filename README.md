@@ -13,6 +13,8 @@ A lightweight utility to extract `.pbix` (Power BI Desktop) files as ZIP archive
 - **Granular Filtering**:
   - Filter in / out `.pbix` files by substring or wildcard.
   - Filter in / out subdirectories during recursion by substring or wildcard.
+- **Long Path Support & Short-Name Fallback**: Automatic support for Windows extended-length paths (`\\?\`) and 8.3 short-name workarounds (`GetShortPathNameW`) to bypass `MAX_PATH` limitations.
+- **Graceful Error Recovery**: If an individual file fails due to an insurmountable path or permission error, it logs the failure and continues unpacking remaining files instead of aborting the process.
 - **Dry-Run Mode**: Preview creations, updates, and unchanged counts without writing to disk.
 
 ---

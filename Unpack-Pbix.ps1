@@ -6,7 +6,8 @@
     Takes all .pbix files in a specified folder, treats them as zip archives, and unzips their contents
     into a subfolder named like the base name of the .pbix file located in the same directory.
     Compares existing files using SHA256 hashes and file lengths to avoid redundant writes.
-    Supports recursive discovery, file name filtering (include/exclude), and folder filtering (include/exclude).
+    Supports recursive discovery, file name filtering (include/exclude), folder filtering (include/exclude),
+    long path extended prefixes (\\?\), Win32 short 8.3 path fallbacks, and graceful error reporting.
 
 .PARAMETER Path
     Target directory containing .pbix files.
@@ -64,6 +65,114 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+# Define Kernel32 P/Invoke for Win32 GetShortPathName on Windows systems
+$isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)
+if ($isWindows) {
+    $csharpMethods = @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+public static class Kernel32PathHelper {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern uint GetShortPathNameW(string lpszLongPath, [Out] StringBuilder lpszShortPath, uint cchBuffer);
+
+    public static string GetShortPath(string path) {
+        try {
+            StringBuilder sb = new StringBuilder(1024);
+            uint res = GetShortPathNameW(path, sb, (uint)sb.Capacity);
+            if (res > 0 && res < sb.Capacity) {
+                return sb.ToString();
+            }
+        } catch { }
+        return null;
+    }
+}
+"@
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'Kernel32PathHelper').Type) {
+            Add-Type -TypeDefinition $csharpMethods
+        }
+    } catch {
+        # Ignore if already added or restricted
+    }
+}
+
+function Format-ExtendedPath {
+    param([string]$FilePath)
+    if (-not $isWindows) { return $FilePath }
+    if ($FilePath.StartsWith("\\?\")) { return $FilePath }
+    if ($FilePath.StartsWith("\\")) {
+        return "\\?\UNC\" + $FilePath.Substring(2)
+    }
+    return "\\?\" + $FilePath
+}
+
+function New-DirectorySafe {
+    param([string]$Dir)
+    if ([System.IO.Directory]::Exists($Dir)) { return }
+    try {
+        [void][System.IO.Directory]::CreateDirectory($Dir)
+    }
+    catch {
+        # Fallback to extended path prefix on Windows
+        if ($isWindows) {
+            try {
+                $ext = Format-ExtendedPath -FilePath $Dir
+                [void][System.IO.Directory]::CreateDirectory($ext)
+                return
+            }
+            catch {
+                # Fallback to short path if available
+                $parent = [System.IO.Path]::GetDirectoryName($Dir)
+                if ($parent -and ([System.Management.Automation.PSTypeName]'Kernel32PathHelper').Type) {
+                    $shortParent = [Kernel32PathHelper]::GetShortPath($parent)
+                    if ($shortParent) {
+                        $shortDir = [System.IO.Path]::Combine($shortParent, [System.IO.Path]::GetFileName($Dir))
+                        [void][System.IO.Directory]::CreateDirectory($shortDir)
+                        return
+                    }
+                }
+            }
+        }
+        throw
+    }
+}
+
+function New-FileStreamSafe {
+    param(
+        [string]$FilePath,
+        [System.IO.FileMode]$Mode,
+        [System.IO.FileAccess]$Access,
+        [System.IO.FileShare]$Share
+    )
+
+    try {
+        return [System.IO.FileStream]::new($FilePath, $Mode, $Access, $Share)
+    }
+    catch {
+        if ($isWindows) {
+            # Try \\?\ prefix
+            try {
+                $ext = Format-ExtendedPath -FilePath $FilePath
+                return [System.IO.FileStream]::new($ext, $Mode, $Access, $Share)
+            }
+            catch {
+                # Try short path of parent directory
+                $dir = [System.IO.Path]::GetDirectoryName($FilePath)
+                if ($dir -and ([System.Management.Automation.PSTypeName]'Kernel32PathHelper').Type) {
+                    $shortDir = [Kernel32PathHelper]::GetShortPath($dir)
+                    if ($shortDir) {
+                        $altPath = [System.IO.Path]::Combine($shortDir, [System.IO.Path]::GetFileName($FilePath))
+                        return [System.IO.FileStream]::new($altPath, $Mode, $Access, $Share)
+                    }
+                }
+            }
+        }
+        throw
+    }
+}
 
 function Test-PatternMatch {
     param(
@@ -126,12 +235,12 @@ function Get-StreamSha256 {
     }
 }
 
-function Get-FileSha256 {
+function Get-FileSha256Safe {
     param(
         [Parameter(Mandatory = $true)]
         [string]$FilePath
     )
-    $fileStream = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    $fileStream = New-FileStreamSafe -FilePath $FilePath -Mode ([System.IO.FileMode]::Open) -Access ([System.IO.FileAccess]::Read) -Share ([System.IO.FileShare]::Read)
     try {
         return Get-StreamSha256 -Stream $fileStream
     }
@@ -159,14 +268,15 @@ function Expand-PbixFile {
     $created = 0
     $updated = 0
     $skipped = 0
+    $errors = 0
 
     $zipArchive = $null
     try {
         $zipArchive = [System.IO.Compression.ZipFile]::OpenRead($PbixPath)
     }
     catch {
-        Write-Error "Failed to open '$PbixPath' as a zip archive: $_"
-        return [PSCustomObject]@{ Created = 0; Updated = 0; Skipped = 0 }
+        Write-Host "  [ERROR] Failed to open '$PbixPath' as a zip archive: $_" -ForegroundColor Red
+        return [PSCustomObject]@{ Created = 0; Updated = 0; Skipped = 0; Errors = 1 }
     }
 
     try {
@@ -186,64 +296,76 @@ function Expand-PbixFile {
             $destFilePath = [System.IO.Path]::Combine($targetDir, $entryRelPath)
             $destFileDir = [System.IO.Path]::GetDirectoryName($destFilePath)
 
-            # Calculate hash of incoming entry
-            $entryStream = $entry.Open()
-            $srcHash = ""
             try {
-                $srcHash = Get-StreamSha256 -Stream $entryStream
-            }
-            finally {
-                $entryStream.Dispose()
-            }
-
-            if ([System.IO.File]::Exists($destFilePath)) {
-                $existingInfo = [System.IO.FileInfo]::new($destFilePath)
-                if ($existingInfo.Length -eq $entry.Length) {
-                    $dstHash = Get-FileSha256 -FilePath $destFilePath
-                    if ($dstHash -eq $srcHash) {
-                        $skipped++
-                        continue
-                    }
+                # Calculate hash of incoming entry
+                $entryStream = $entry.Open()
+                $srcHash = ""
+                try {
+                    $srcHash = Get-StreamSha256 -Stream $entryStream
+                }
+                finally {
+                    $entryStream.Dispose()
                 }
 
-                # File content differs
-                if (-not $IsDryRun) {
-                    if (-not [System.IO.Directory]::Exists($destFileDir)) {
-                        [void][System.IO.Directory]::CreateDirectory($destFileDir)
-                    }
-                    $entryStream = $entry.Open()
-                    $dstFileStream = [System.IO.File]::Create($destFilePath)
-                    try {
-                        $entryStream.CopyTo($dstFileStream)
-                    }
-                    finally {
-                        $dstFileStream.Dispose()
-                        $entryStream.Dispose()
-                    }
+                $fileExists = $false
+                $existingLength = -1
+                if ([System.IO.File]::Exists($destFilePath)) {
+                    $fileExists = $true
+                    $existingLength = (New-Object System.IO.FileInfo($destFilePath)).Length
                 }
-                $updated++
-                $tag = if ($IsDryRun) { "[DRY-RUN UPDATED]" } else { "[UPDATED]" }
-                Write-Host "  $tag $entryRelPath" -ForegroundColor Yellow
+                elseif ($isWindows -and [System.IO.File]::Exists((Format-ExtendedPath -FilePath $destFilePath))) {
+                    $fileExists = $true
+                    $existingLength = (New-Object System.IO.FileInfo((Format-ExtendedPath -FilePath $destFilePath))).Length
+                }
+
+                if ($fileExists) {
+                    if ($existingLength -eq $entry.Length) {
+                        $dstHash = Get-FileSha256Safe -FilePath $destFilePath
+                        if ($dstHash -eq $srcHash) {
+                            $skipped++
+                            continue
+                        }
+                    }
+
+                    # File content differs
+                    if (-not $IsDryRun) {
+                        New-DirectorySafe -Dir $destFileDir
+                        $entryStream = $entry.Open()
+                        $dstFileStream = New-FileStreamSafe -FilePath $destFilePath -Mode ([System.IO.FileMode]::Create) -Access ([System.IO.FileAccess]::Write) -Share ([System.IO.FileShare]::None)
+                        try {
+                            $entryStream.CopyTo($dstFileStream)
+                        }
+                        finally {
+                            $dstFileStream.Dispose()
+                            $entryStream.Dispose()
+                        }
+                    }
+                    $updated++
+                    $tag = if ($IsDryRun) { "[DRY-RUN UPDATED]" } else { "[UPDATED]" }
+                    Write-Host "  $tag $entryRelPath" -ForegroundColor Yellow
+                }
+                else {
+                    # New file
+                    if (-not $IsDryRun) {
+                        New-DirectorySafe -Dir $destFileDir
+                        $entryStream = $entry.Open()
+                        $dstFileStream = New-FileStreamSafe -FilePath $destFilePath -Mode ([System.IO.FileMode]::Create) -Access ([System.IO.FileAccess]::Write) -Share ([System.IO.FileShare]::None)
+                        try {
+                            $entryStream.CopyTo($dstFileStream)
+                        }
+                        finally {
+                            $dstFileStream.Dispose()
+                            $entryStream.Dispose()
+                        }
+                    }
+                    $created++
+                    $tag = if ($IsDryRun) { "[DRY-RUN CREATED]" } else { "[CREATED]" }
+                    Write-Host "  $tag $entryRelPath" -ForegroundColor Green
+                }
             }
-            else {
-                # New file
-                if (-not $IsDryRun) {
-                    if (-not [System.IO.Directory]::Exists($destFileDir)) {
-                        [void][System.IO.Directory]::CreateDirectory($destFileDir)
-                    }
-                    $entryStream = $entry.Open()
-                    $dstFileStream = [System.IO.File]::Create($destFilePath)
-                    try {
-                        $entryStream.CopyTo($dstFileStream)
-                    }
-                    finally {
-                        $dstFileStream.Dispose()
-                        $entryStream.Dispose()
-                    }
-                }
-                $created++
-                $tag = if ($IsDryRun) { "[DRY-RUN CREATED]" } else { "[CREATED]" }
-                Write-Host "  $tag $entryRelPath" -ForegroundColor Green
+            catch {
+                $errors++
+                Write-Host "  [SKIPPED - ERROR] Could not unpack '$entryRelPath': $_" -ForegroundColor Red
             }
         }
     }
@@ -254,12 +376,14 @@ function Expand-PbixFile {
     }
 
     $summaryLabel = if ($IsDryRun) { "Dry-run summary" } else { "Unpacked" }
-    Write-Host "  -> $summaryLabel : $created created, $updated updated, $skipped unchanged." -ForegroundColor Gray
+    $errorMsg = if ($errors -gt 0) { ", $errors failed/skipped" } else { "" }
+    Write-Host "  -> $summaryLabel : $created created, $updated updated, $skipped unchanged$errorMsg." -ForegroundColor Gray
 
     return [PSCustomObject]@{
         Created = $created
         Updated = $updated
         Skipped = $skipped
+        Errors  = $errors
     }
 }
 
@@ -313,12 +437,14 @@ Write-Host "Found $($discoveredFiles.Count) matching .pbix file(s)." -Foreground
 $totalCreated = 0
 $totalUpdated = 0
 $totalSkipped = 0
+$totalErrors  = 0
 
 foreach ($file in $discoveredFiles) {
     $res = Expand-PbixFile -PbixPath $file -IsDryRun $DryRun.IsPresent
     $totalCreated += $res.Created
     $totalUpdated += $res.Updated
     $totalSkipped += $res.Skipped
+    $totalErrors  += $res.Errors
 }
 
 Write-Host "`n==================================================" -ForegroundColor Cyan
@@ -327,4 +453,7 @@ Write-Host "  PBIX files processed : $($discoveredFiles.Count)"
 Write-Host "  Files created        : $totalCreated"
 Write-Host "  Files updated        : $totalUpdated"
 Write-Host "  Files unchanged      : $totalSkipped"
+if ($totalErrors -gt 0) {
+    Write-Host "  Files/items errored  : $totalErrors (skipped gracefully)" -ForegroundColor Red
+}
 Write-Host "==================================================" -ForegroundColor Cyan
