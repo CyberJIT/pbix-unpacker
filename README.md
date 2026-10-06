@@ -18,6 +18,13 @@ A lightweight utility to extract `.pbix` and `.pbit` (Power BI Desktop & Templat
   - Pretty-prints `DataModelSchema_Pretty.json`.
   - Decomposes all **DAX measures** into standalone `.dax` files categorized by table under `DataModelSchema_Extracted/Measures/<Table>/<Measure>.dax`.
   - Extracts table metadata, model partitions (embedded M queries), and relationships JSON.
+- **Report Visuals & Layout Deconstruction (`pbi-tools` style)**:
+  - Formats `Report/Layout` into `Report_Extracted/Layout_Pretty.json`.
+  - Deconstructs pages into `Report_Extracted/Pages/<PageName>/page.json`.
+  - Extracts individual visual containers into readable JSONs under `Report_Extracted/Pages/<PageName>/Visuals/<Index>_<Type>_<ID>.json`, unwrapping nested escaped JSON strings (`config`, `filters`, `dataTransforms`).
+  - Pretty-prints `DiagramLayout_Pretty.json` (diagram visual coordinates).
+  - Formats `LinguisticSchema_Pretty.xml` (Q&A natural language definitions).
+  - Formats `Settings_Pretty.json` and `Metadata_Pretty.json`.
 - **Content-Aware Delta Updates**: Checks file size and SHA-256 checksums to avoid touching unchanged files.
 - **Recursive Directory Traversal**: Optional recursive search across nested folders for `.pbix` and `.pbit` files.
 - **Granular Filtering**:
@@ -29,14 +36,14 @@ A lightweight utility to extract `.pbix` and `.pbit` (Power BI Desktop & Templat
 
 ---
 
-## 1. Python Tool (`pbix_unpacker.py`, `mashup_parser.py`, `schema_parser.py`)
+## 1. Python Tool (`pbix_unpacker.py`, `mashup_parser.py`, `schema_parser.py`, `layout_parser.py`)
 
 Requires Python 3.7+ (pure standard library, zero external dependencies).
 
 ### Usage
 
 ```bash
-# Basic unpack of a folder (automatic DataMashup & DataModelSchema deconstruction)
+# Basic unpack of a folder (automatic DataMashup, DataModelSchema & Report visual deconstruction)
 python3 pbix_unpacker.py -p "/path/to/reports"
 
 # Recursive scan under subdirectories
@@ -53,7 +60,7 @@ python3 pbix_unpacker.py -p "/path/to/reports" -r \
   --folder-exclude "Archive" "Old"
 
 # Skip deep deconstruction if raw archive unpacking is desired
-python3 pbix_unpacker.py -p "/path/to/reports" --no-mashup --no-schema
+python3 pbix_unpacker.py -p "/path/to/reports" --no-mashup --no-schema --no-report
 
 # Dry run simulation
 python3 pbix_unpacker.py -p "/path/to/reports" -r --dry-run
@@ -71,6 +78,7 @@ python3 pbix_unpacker.py -p "/path/to/reports" -r --dry-run
 | | `--folder-exclude` | One or more patterns/substrings to prune folders during recursion. |
 | | `--no-mashup` | Skip deep parsing and extraction of `DataMashup`. |
 | | `--no-schema` | Skip deep parsing and extraction of `DataModelSchema`. |
+| | `--no-report` | Skip deep parsing and deconstruction of `Report` layout, visuals, and diagrams. |
 | `-n` | `--dry-run` | Preview actions without creating or replacing files. |
 
 ---
@@ -82,7 +90,7 @@ Compatible with Windows PowerShell 5.1+ and PowerShell 7+ (Core / macOS / Linux)
 ### Usage
 
 ```powershell
-# Basic unpack (with automatic DataMashup & DataModelSchema deconstruction)
+# Basic unpack (with automatic DataMashup, DataModelSchema & Report visual deconstruction)
 .\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports"
 
 # Recursive scan
@@ -99,7 +107,7 @@ Compatible with Windows PowerShell 5.1+ and PowerShell 7+ (Core / macOS / Linux)
   -FolderExclude "Archive", "Old"
 
 # Skip deep deconstruction
-.\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports" -NoMashup -NoSchema
+.\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports" -NoMashup -NoSchema -NoReport
 
 # Dry run simulation
 .\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports" -Recurse -DryRun
@@ -117,6 +125,7 @@ Compatible with Windows PowerShell 5.1+ and PowerShell 7+ (Core / macOS / Linux)
 | `-FolderExclude` | `String[]` | List of substrings or wildcards of folders to skip. |
 | `-NoMashup` | `Switch` | Skip deep parsing and extraction of `DataMashup`. |
 | `-NoSchema` | `Switch` | Skip deep parsing and extraction of `DataModelSchema`. |
+| `-NoReport` | `Switch` | Skip deep parsing and extraction of `Report` layout, visuals, and diagrams. |
 | `-DryRun` | `Switch` | Preview operations without touching disk files. |
 
 ---
@@ -145,18 +154,30 @@ Report/
 │   └── Queries/
 │       ├── Customers.m
 │       └── Orders.m
-└── DataModelSchema_Extracted/  <- Extracted TMSL model definitions
-    ├── DataModelSchema_Pretty.json
-    ├── Relationships.json
-    ├── Tables/
-    │   ├── Sales.json
-    │   └── Date.json
-    ├── Partitions/
-    │   └── Sales_SalesPartition.m
-    └── Measures/
-        └── Sales/
-            ├── Total Sales.dax
-            └── Sales YTD.dax
+├── DataModelSchema_Extracted/  <- Extracted TMSL model definitions
+│   ├── DataModelSchema_Pretty.json
+│   ├── Relationships.json
+│   ├── Tables/
+│   │   ├── Sales.json
+│   │   └── Date.json
+│   ├── Partitions/
+│   │   └── Sales_SalesPartition.m
+│   └── Measures/
+│       └── Sales/
+│           ├── Total Sales.dax
+│           └── Sales YTD.dax
+└── Report_Extracted/           <- Deconstructed visual layout and diagrams
+    ├── Layout_Pretty.json
+    ├── DiagramLayout_Pretty.json
+    ├── LinguisticSchema_Pretty.xml
+    ├── Settings_Pretty.json
+    ├── Metadata_Pretty.json
+    └── Pages/
+        └── 01_Executive Summary/
+            ├── page.json
+            └── Visuals/
+                ├── 01_barChart_visual1.json
+                └── 02_card_visual2.json
 ```
 
 ---
@@ -168,7 +189,8 @@ Report/
 | **MS-QDEFF Binary Decompilation** | Fully supported (`struct`, `io.BytesIO`) | Fully supported (`BinaryReader`, `MemoryStream`) |
 | **DataModelSchema TMSL JSON** | Fully supported (`json`, UTF-16LE auto-decode) | Fully supported (`ConvertFrom-Json`) |
 | **DAX Measures Deconstruction** | Fully supported | Fully supported |
-| **M Partitions Extraction** | Fully supported | Fully supported |
+| **Report Layout & Visual Containers** | Fully supported (`layout_parser.py`) | Fully supported (`ConvertFrom-Json`, nested string unwrap) |
+| **Diagram Layout & Linguistic Schema** | Fully supported | Fully supported |
 | **Third-Party Dependencies** | **None** (zero pip installs) | **None** (standard .NET assemblies) |
 
 ---

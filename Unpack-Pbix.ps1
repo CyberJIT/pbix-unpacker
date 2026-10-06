@@ -1,14 +1,15 @@
 <#
 .SYNOPSIS
     Unpacks .pbix and .pbit files into folders, maintaining internal tree structure, delta synchronization,
-    and deep deconstruction of Power Query DataMashup (MS-QDEFF) and DataModelSchema (TMSL JSON).
+    and deep deconstruction of Power Query DataMashup, DataModelSchema, and Report Layout artifacts.
 
 .DESCRIPTION
     Takes all .pbix and .pbit files in a specified folder, treats them as zip archives, and unzips their contents
     into a subfolder named like the base name of each file located in the same directory.
     Compares existing files using SHA256 hashes and file lengths to avoid redundant writes.
-    Decompiles DataMashup (Power Query M formulas, queries, XML settings).
+    Decompiles DataMashup (Power Query M formulas, individual queries, XML settings).
     Decompiles DataModelSchema (TMSL JSON, tables, partitions, relationships, DAX measures).
+    Decompiles Report/Layout (pages metadata, individual visual containers, filters, diagrams, linguistic schema).
     Supports recursive discovery, file name filtering (include/exclude), folder filtering (include/exclude),
     long path extended prefixes (\\?\), Win32 short 8.3 path fallbacks, and graceful error reporting.
 
@@ -35,6 +36,9 @@
 
 .PARAMETER NoSchema
     Disable deep deconstruction of DataModelSchema (TMSL JSON and DAX measures).
+
+.PARAMETER NoReport
+    Disable deep deconstruction of Report Layout (pages, visuals, diagrams).
 
 .PARAMETER DryRun
     Simulate execution without modifying the filesystem.
@@ -70,6 +74,9 @@ param(
 
     [Parameter(Mandatory = $false)]
     [switch]$NoSchema,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$NoReport,
 
     [Parameter(Mandatory = $false)]
     [switch]$DryRun
@@ -279,7 +286,9 @@ function Get-SanitizedFileName {
     param([string]$FileName)
     $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
     $pattern = '[' + [regex]::Escape(-join $invalidChars) + ']'
-    return ($FileName -replace $pattern, '_').Trim()
+    $clean = ($FileName -replace $pattern, '_').Trim()
+    if ([string]::IsNullOrWhiteSpace($clean)) { return "Unnamed" }
+    return $clean
 }
 
 function Write-DeltaFile {
@@ -343,6 +352,28 @@ function Write-DeltaFile {
     }
 }
 
+function Decode-AutoString {
+    param([byte[]]$Bytes)
+    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE) {
+        return [System.Text.Encoding]::Unicode.GetString($Bytes)
+    }
+    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFE -and $Bytes[1] -eq 0xFF) {
+        return [System.Text.Encoding]::BigEndianUnicode.GetString($Bytes)
+    }
+    if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) {
+        return [System.Text.Encoding]::UTF8.GetString($Bytes)
+    }
+    if ($Bytes.Length -ge 2 -and $Bytes[1] -eq 0) {
+        return [System.Text.Encoding]::Unicode.GetString($Bytes)
+    }
+    try {
+        return [System.Text.Encoding]::UTF8.GetString($Bytes)
+    }
+    catch {
+        return [System.Text.Encoding]::Unicode.GetString($Bytes)
+    }
+}
+
 function Split-MQueries {
     param([string]$SectionText)
     $queries = [System.Collections.Generic.Dictionary[string, string]]::new()
@@ -376,28 +407,6 @@ function Split-MQueries {
     }
 
     return $queries
-}
-
-function Decode-SchemaString {
-    param([byte[]]$Bytes)
-    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE) {
-        return [System.Text.Encoding]::Unicode.GetString($Bytes)
-    }
-    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFE -and $Bytes[1] -eq 0xFF) {
-        return [System.Text.Encoding]::BigEndianUnicode.GetString($Bytes)
-    }
-    if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) {
-        return [System.Text.Encoding]::UTF8.GetString($Bytes)
-    }
-    if ($Bytes.Length -ge 2 -and $Bytes[1] -eq 0) {
-        return [System.Text.Encoding]::Unicode.GetString($Bytes)
-    }
-    try {
-        return [System.Text.Encoding]::UTF8.GetString($Bytes)
-    }
-    catch {
-        return [System.Text.Encoding]::Unicode.GetString($Bytes)
-    }
 }
 
 function Expand-DataMashupBinary {
@@ -434,7 +443,6 @@ function Expand-DataMashupBinary {
             $metaBytes = $reader.ReadBytes($metaLen)
         }
 
-        # 1. Package ZIP extraction
         if ($pkgBytes.Length -gt 0) {
             $pkgMem = [System.IO.MemoryStream]::new($pkgBytes)
             $zip = [System.IO.Compression.ZipArchive]::new($pkgMem, [System.IO.Compression.ZipArchiveMode]::Read)
@@ -477,7 +485,6 @@ function Expand-DataMashupBinary {
             }
         }
 
-        # 2. Permissions XML
         if ($permBytes.Length -gt 0) {
             $permStr = [System.Text.Encoding]::UTF8.GetString($permBytes)
             $pXmlPretty = Format-XmlPretty -RawXml $permStr
@@ -487,7 +494,6 @@ function Expand-DataMashupBinary {
             $created += $r.Created; $updated += $r.Updated; $skipped += $r.Skipped
         }
 
-        # 3. Metadata XML
         if ($metaBytes.Length -ge 8) {
             $metaMem = [System.IO.MemoryStream]::new($metaBytes)
             $mReader = [System.IO.BinaryReader]::new($metaMem)
@@ -526,12 +532,11 @@ function Expand-DataModelSchemaBinary {
     $created = 0; $updated = 0; $skipped = 0; $errors = 0
 
     try {
-        $jsonStr = Decode-SchemaString -Bytes $SchemaBytes
+        $jsonStr = Decode-AutoString -Bytes $SchemaBytes
         $schemaObj = $jsonStr | ConvertFrom-Json
 
         if (-not $schemaObj) { return [PSCustomObject]@{ Created=0; Updated=0; Skipped=0; Errors=0 } }
 
-        # 1. Pretty JSON
         $prettyJson = $schemaObj | ConvertTo-Json -Depth 100
         $rel = "DataModelSchema_Extracted/DataModelSchema_Pretty.json"
         $dest = [System.IO.Path]::Combine($TargetDir, $rel)
@@ -540,20 +545,17 @@ function Expand-DataModelSchemaBinary {
 
         $model = if ($schemaObj.PSObject.Properties['model']) { $schemaObj.model } else { $schemaObj }
 
-        # 2. Decompose Tables & Measures
         if ($model.PSObject.Properties['tables'] -and $model.tables) {
             foreach ($tbl in $model.tables) {
                 $tName = if ($tbl.name) { $tbl.name } else { "UnnamedTable" }
                 $safeT = Get-SanitizedFileName -FileName $tName
 
-                # Write Table metadata
                 $tJson = $tbl | ConvertTo-Json -Depth 50
                 $tRel = "DataModelSchema_Extracted/Tables/$safeT.json"
                 $tDest = [System.IO.Path]::Combine($TargetDir, $tRel)
                 $tr = Write-DeltaFile -DestFilePath $tDest -Bytes ([System.Text.Encoding]::UTF8.GetBytes($tJson)) -RelPath $tRel -IsDryRun $IsDryRun
                 $created += $tr.Created; $updated += $tr.Updated; $skipped += $tr.Skipped
 
-                # Measures
                 if ($tbl.PSObject.Properties['measures'] -and $tbl.measures) {
                     foreach ($m in $tbl.measures) {
                         $mName = if ($m.name) { $m.name } else { "UnnamedMeasure" }
@@ -576,7 +578,6 @@ function Expand-DataModelSchemaBinary {
                     }
                 }
 
-                # Partitions & M expressions
                 if ($tbl.PSObject.Properties['partitions'] -and $tbl.partitions) {
                     foreach ($p in $tbl.partitions) {
                         if ($p.PSObject.Properties['source'] -and $p.source -and $p.source.PSObject.Properties['type'] -and $p.source.type.ToString().ToLower() -eq 'm') {
@@ -593,7 +594,6 @@ function Expand-DataModelSchemaBinary {
             }
         }
 
-        # 3. Relationships
         if ($model.PSObject.Properties['relationships'] -and $model.relationships) {
             $relJson = $model.relationships | ConvertTo-Json -Depth 50
             $rRel = "DataModelSchema_Extracted/Relationships.json"
@@ -605,6 +605,102 @@ function Expand-DataModelSchemaBinary {
     catch {
         $errors++
         Write-Host "  [SKIPPED - ERROR] Could not decompile DataModelSchema: $_" -ForegroundColor Red
+    }
+
+    return [PSCustomObject]@{ Created = $created; Updated = $updated; Skipped = $skipped; Errors = $errors }
+}
+
+function Expand-ReportArtifacts {
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetDir,
+        [Parameter(Mandatory = $false)][byte[]]$LayoutBytes,
+        [Parameter(Mandatory = $false)][byte[]]$DiagramBytes,
+        [Parameter(Mandatory = $false)][byte[]]$LinguisticBytes,
+        [Parameter(Mandatory = $false)][byte[]]$SettingsBytes,
+        [Parameter(Mandatory = $false)][byte[]]$MetadataBytes,
+        [Parameter(Mandatory = $false)][bool]$IsDryRun = $false
+    )
+
+    $created = 0; $updated = 0; $skipped = 0; $errors = 0
+
+    # 1. Report Layout
+    if ($LayoutBytes) {
+        try {
+            $layoutStr = Decode-AutoString -Bytes $LayoutBytes
+            $layoutObj = $layoutStr | ConvertFrom-Json
+
+            $prettyLayout = $layoutObj | ConvertTo-Json -Depth 100
+            $rel = "Report_Extracted/Layout_Pretty.json"
+            $dest = [System.IO.Path]::Combine($TargetDir, $rel)
+            $r = Write-DeltaFile -DestFilePath $dest -Bytes ([System.Text.Encoding]::UTF8.GetBytes($prettyLayout)) -RelPath $rel -IsDryRun $IsDryRun
+            $created += $r.Created; $updated += $r.Updated; $skipped += $r.Skipped
+
+            if ($layoutObj.PSObject.Properties['sections'] -and $layoutObj.sections) {
+                $idx = 1
+                foreach ($sec in $layoutObj.sections) {
+                    $dName = if ($sec.displayName) { $sec.displayName } else { "Page_$idx" }
+                    $safePage = "{0:D2}_{1}" -f $idx, (Get-SanitizedFileName -FileName $dName)
+
+                    $pRel = "Report_Extracted/Pages/$safePage/page.json"
+                    $pDest = [System.IO.Path]::Combine($TargetDir, $pRel)
+                    $pJson = $sec | ConvertTo-Json -Depth 50
+                    $pr = Write-DeltaFile -DestFilePath $pDest -Bytes ([System.Text.Encoding]::UTF8.GetBytes($pJson)) -RelPath $pRel -IsDryRun $IsDryRun
+                    $created += $pr.Created; $updated += $pr.Updated; $skipped += $pr.Skipped
+
+                    if ($sec.PSObject.Properties['visualContainers'] -and $sec.visualContainers) {
+                        $vIdx = 1
+                        foreach ($vc in $sec.visualContainers) {
+                            $vType = "visual"
+                            if ($vc.PSObject.Properties['config'] -and $vc.config) {
+                                try {
+                                    $cfgObj = $vc.config | ConvertFrom-Json
+                                    if ($cfgObj.singleVisual -and $cfgObj.singleVisual.visualType) {
+                                        $vType = $cfgObj.singleVisual.visualType
+                                    }
+                                } catch { }
+                            }
+                            $safeVType = Get-SanitizedFileName -FileName $vType
+                            $vId = if ($vc.id) { $vc.id } else { $vIdx }
+                            $vRel = "Report_Extracted/Pages/$safePage/Visuals/{0:D2}_{1}_{2}.json" -f $vIdx, $safeVType, $vId
+                            $vDest = [System.IO.Path]::Combine($TargetDir, $vRel)
+                            $vJson = $vc | ConvertTo-Json -Depth 50
+                            $vr = Write-DeltaFile -DestFilePath $vDest -Bytes ([System.Text.Encoding]::UTF8.GetBytes($vJson)) -RelPath $vRel -IsDryRun $IsDryRun
+                            $created += $vr.Created; $updated += $vr.Updated; $skipped += $vr.Skipped
+                            $vIdx++
+                        }
+                    }
+                    $idx++
+                }
+            }
+        }
+        catch {
+            $errors++
+            Write-Host "  [SKIPPED - ERROR] Could not decompile Report Layout: $_" -ForegroundColor Red
+        }
+    }
+
+    # 2. DiagramLayout
+    if ($DiagramBytes) {
+        try {
+            $diagStr = Decode-AutoString -Bytes $DiagramBytes
+            $diagObj = $diagStr | ConvertFrom-Json
+            $rel = "Report_Extracted/DiagramLayout_Pretty.json"
+            $dest = [System.IO.Path]::Combine($TargetDir, $rel)
+            $r = Write-DeltaFile -DestFilePath $dest -Bytes ([System.Text.Encoding]::UTF8.GetBytes(($diagObj | ConvertTo-Json -Depth 50))) -RelPath $rel -IsDryRun $IsDryRun
+            $created += $r.Created; $updated += $r.Updated; $skipped += $r.Skipped
+        } catch { }
+    }
+
+    # 3. LinguisticSchema
+    if ($LinguisticBytes) {
+        try {
+            $lingStr = Decode-AutoString -Bytes $LinguisticBytes
+            $pXml = Format-XmlPretty -RawXml $lingStr
+            $rel = "Report_Extracted/LinguisticSchema_Pretty.xml"
+            $dest = [System.IO.Path]::Combine($TargetDir, $rel)
+            $r = Write-DeltaFile -DestFilePath $dest -Bytes ([System.Text.Encoding]::UTF8.GetBytes($pXml)) -RelPath $rel -IsDryRun $IsDryRun
+            $created += $r.Created; $updated += $r.Updated; $skipped += $r.Skipped
+        } catch { }
     }
 
     return [PSCustomObject]@{ Created = $created; Updated = $updated; Skipped = $skipped; Errors = $errors }
@@ -622,7 +718,10 @@ function Expand-PbixFile {
         [bool]$ParseMashup = $true,
 
         [Parameter(Mandatory = $false)]
-        [bool]$ParseSchema = $true
+        [bool]$ParseSchema = $true,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$ParseReport = $true
     )
 
     $parentDir = [System.IO.Path]::GetDirectoryName($PbixPath)
@@ -638,6 +737,11 @@ function Expand-PbixFile {
     $errors = 0
     $mashupBytes = $null
     $schemaBytes = $null
+    $layoutBytes = $null
+    $diagramBytes = $null
+    $linguisticBytes = $null
+    $settingsBytes = $null
+    $metadataBytes = $null
 
     $zipArchive = $null
     try {
@@ -679,6 +783,21 @@ function Expand-PbixFile {
                 }
                 elseif ($entryRelPath -eq "DataModelSchema" -or $entryRelPath -eq "DataModelSchema.json") {
                     $schemaBytes = $bytes
+                }
+                elseif ($entryRelPath -eq "Report/Layout") {
+                    $layoutBytes = $bytes
+                }
+                elseif ($entryRelPath -eq "DiagramLayout") {
+                    $diagramBytes = $bytes
+                }
+                elseif ($entryRelPath -eq "Report/LinguisticSchema") {
+                    $linguisticBytes = $bytes
+                }
+                elseif ($entryRelPath -eq "Settings") {
+                    $settingsBytes = $bytes
+                }
+                elseif ($entryRelPath -eq "Metadata") {
+                    $metadataBytes = $bytes
                 }
 
                 $r = Write-DeltaFile -DestFilePath $destFilePath -Bytes $bytes -RelPath $entryRelPath -IsDryRun $IsDryRun
@@ -725,6 +844,18 @@ function Expand-PbixFile {
         }
         else {
             Write-Host "  [NOTE] No DataModelSchema entry in this file (standard in .pbit templates; .pbix files store raw VertiPaq in DataModel)." -ForegroundColor DarkGray
+        }
+    }
+
+    # 3. Deep Report Layout & Secondary Artifacts
+    if ($ParseReport) {
+        if ($null -ne $layoutBytes -or $null -ne $diagramBytes -or $null -ne $linguisticBytes) {
+            Write-Host "  -> Decompiling Report Artifacts (Pages, Visuals, Diagrams, Linguistic Schema)..." -ForegroundColor Cyan
+            $rr = Expand-ReportArtifacts -TargetDir $targetDir -LayoutBytes $layoutBytes -DiagramBytes $diagramBytes -LinguisticBytes $linguisticBytes -SettingsBytes $settingsBytes -MetadataBytes $metadataBytes -IsDryRun $IsDryRun
+            $created += $rr.Created
+            $updated += $rr.Updated
+            $skipped += $rr.Skipped
+            $errors += $rr.Errors
         }
     }
 
@@ -791,7 +922,7 @@ $totalSkipped = 0
 $totalErrors  = 0
 
 foreach ($file in $discoveredFiles) {
-    $res = Expand-PbixFile -PbixPath $file -IsDryRun $DryRun.IsPresent -ParseMashup (-not $NoMashup.IsPresent) -ParseSchema (-not $NoSchema.IsPresent)
+    $res = Expand-PbixFile -PbixPath $file -IsDryRun $DryRun.IsPresent -ParseMashup (-not $NoMashup.IsPresent) -ParseSchema (-not $NoSchema.IsPresent) -ParseReport (-not $NoReport.IsPresent)
     $totalCreated += $res.Created
     $totalUpdated += $res.Updated
     $totalSkipped += $res.Skipped

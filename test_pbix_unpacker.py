@@ -2,6 +2,7 @@
 Unit tests for pbix_unpacker.py
 """
 
+import json
 import os
 import shutil
 import tempfile
@@ -48,8 +49,8 @@ class TestPbixUnpacker(unittest.TestCase):
             },
         )
 
-        # 1st run: all files should be created
-        created, updated, skipped, errors = unpack_single_pbix(pbix_path)
+        # 1st run: all files should be created (with parse_report=False for base test)
+        created, updated, skipped, errors = unpack_single_pbix(pbix_path, parse_report=False)
         self.assertEqual(created, 3)
         self.assertEqual(updated, 0)
         self.assertEqual(skipped, 0)
@@ -60,7 +61,7 @@ class TestPbixUnpacker(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(extracted_dir, "Report", "Layout")))
 
         # 2nd run with unchanged pbix: all should be skipped
-        c2, u2, s2, e2 = unpack_single_pbix(pbix_path)
+        c2, u2, s2, e2 = unpack_single_pbix(pbix_path, parse_report=False)
         self.assertEqual(c2, 0)
         self.assertEqual(u2, 0)
         self.assertEqual(s2, 3)
@@ -76,7 +77,7 @@ class TestPbixUnpacker(unittest.TestCase):
                 "Metadata/Version": b"1.2.3",          # New
             },
         )
-        c3, u3, s3, e3 = unpack_single_pbix(pbix_path)
+        c3, u3, s3, e3 = unpack_single_pbix(pbix_path, parse_report=False)
         self.assertEqual(c3, 1)  # Version created
         self.assertEqual(u3, 1)  # DataModel updated
         self.assertEqual(s3, 2)  # Layout and SecurityBindings skipped
@@ -253,6 +254,75 @@ in
             dax_content = f.read()
             self.assertIn("SUM(Sales[Amount])", dax_content)
 
+    def test_report_artifacts_extraction(self):
+        sample_layout = {
+            "id": 0,
+            "resourcePackages": [],
+            "sections": [
+                {
+                    "name": "ReportSection1",
+                    "displayName": "Executive Summary",
+                    "width": 1280.0,
+                    "height": 720.0,
+                    "visualContainers": [
+                        {
+                            "x": 10,
+                            "y": 20,
+                            "z": 0,
+                            "width": 300,
+                            "height": 200,
+                            "config": json.dumps({"name": "vis_chart_1", "singleVisual": {"visualType": "barChart"}}),
+                            "filters": "[]",
+                            "query": "{}"
+                        }
+                    ]
+                }
+            ]
+        }
+        sample_diagram = {
+            "version": "1.0.0",
+            "diagrams": [{"name": "All Tables", "layout": {"nodeLayout": {"Sales": {"x": 100, "y": 200}}}}]
+        }
+        sample_linguistic = "<Language xmlns=\"http://schemas.microsoft.com/powerbi/linguistic\"><Entities><Entity name=\"Sales\"/></Entities></Language>"
+
+        pbix_data = {
+            "Report/Layout": json.dumps(sample_layout).encode("utf-16le"),
+            "DiagramLayout": json.dumps(sample_diagram).encode("utf-16le"),
+            "Report/LinguisticSchema": sample_linguistic.encode("utf-16le"),
+            "Metadata": json.dumps({"version": 2}).encode("utf-16le"),
+            "Settings": json.dumps({"useStyling": True}).encode("utf-16le"),
+        }
+
+        pbix_path = self._create_pbix("VisualReport.pbix", pbix_data)
+        c, u, s, e = unpack_single_pbix(pbix_path, parse_report=True)
+        self.assertEqual(e, 0)
+        self.assertGreater(c, 0)
+
+        extracted_dir = os.path.join(self.test_dir, "VisualReport")
+        rep_dir = os.path.join(extracted_dir, "Report_Extracted")
+
+        # Verify extracted files
+        self.assertTrue(os.path.exists(os.path.join(rep_dir, "Layout_Pretty.json")))
+        self.assertTrue(os.path.exists(os.path.join(rep_dir, "DiagramLayout_Pretty.json")))
+        self.assertTrue(os.path.exists(os.path.join(rep_dir, "LinguisticSchema_Pretty.xml")))
+        self.assertTrue(os.path.exists(os.path.join(rep_dir, "Metadata_Pretty.json")))
+        self.assertTrue(os.path.exists(os.path.join(rep_dir, "Settings_Pretty.json")))
+
+        # Check page and visual container extraction
+        page_dir = os.path.join(rep_dir, "Pages", "01_Executive Summary")
+        self.assertTrue(os.path.exists(page_dir))
+        self.assertTrue(os.path.exists(os.path.join(page_dir, "page.json")))
+        visuals_dir = os.path.join(page_dir, "Visuals")
+        self.assertTrue(os.path.exists(visuals_dir))
+        
+        # Verify visual JSON content
+        vis_files = os.listdir(visuals_dir)
+        self.assertEqual(len(vis_files), 1)
+        with open(os.path.join(visuals_dir, vis_files[0]), "r", encoding="utf-8") as f:
+            vis_obj = json.load(f)
+            self.assertEqual(vis_obj.get("config", {}).get("singleVisual", {}).get("visualType"), "barChart")
+
 
 if __name__ == "__main__":
     unittest.main()
+

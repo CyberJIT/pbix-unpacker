@@ -8,8 +8,9 @@ hierarchies, and only replacing files if they are new or have different contents
 
 Supports recursive scanning, file name filters (include/exclude), folder name filters (include/exclude),
 Windows extended-length paths (\\\\?\\) and short 8.3 path fallbacks, graceful error recovery,
-deep parsing of DataMashup (MS-QDEFF) into Power Query (M) scripts, and decompilation of
-DataModelSchema (TMSL JSON) into measures, tables, partitions, and relationships.
+deep parsing of DataMashup (MS-QDEFF) into Power Query (M) scripts, decompilation of
+DataModelSchema (TMSL JSON) into measures, tables, partitions, and relationships, and
+extended report artifacts (Report/Layout pages and visuals, DiagramLayout, LinguisticSchema, Settings, Metadata).
 """
 
 import argparse
@@ -23,6 +24,7 @@ import sys
 import zipfile
 from typing import List, Optional, Tuple
 
+from layout_parser import ReportLayoutParser, decode_text_auto, pretty_xml
 from mashup_parser import DataMashupParser
 from schema_parser import DataModelSchemaParser, decode_schema_bytes
 
@@ -202,7 +204,8 @@ def write_file_delta(dest_file_path: str, content_bytes: bytes, rel_path: str, d
 
 def sanitize_filename(name: str) -> str:
     """Sanitize string for safe usage as a cross-platform filename."""
-    return re.sub(r'[\\/*?:"<>|]', "_", name).strip()
+    clean = re.sub(r'[\\/*?:"<>|%]', "_", name).strip()
+    return clean if clean else "Unnamed"
 
 
 def extract_datamashup_artifacts(
@@ -333,7 +336,7 @@ def extract_datamodelschema_artifacts(
                 errors += 1
                 print(f"  [SKIPPED - ERROR] Could not write table metadata '{safe_t}': {e}", file=sys.stderr)
 
-    # 4. M Partitions (Power Query source code inside Model tables)
+    # 4. M Partitions
     m_partitions = artifacts.get("m_partitions", {})
     if m_partitions:
         for p_name, p_code in m_partitions.items():
@@ -363,15 +366,128 @@ def extract_datamodelschema_artifacts(
     return (created, updated, skipped, errors)
 
 
+def extract_report_artifacts(
+    target_dir: str,
+    layout_bytes: Optional[bytes] = None,
+    diagram_bytes: Optional[bytes] = None,
+    linguistic_bytes: Optional[bytes] = None,
+    settings_bytes: Optional[bytes] = None,
+    metadata_bytes: Optional[bytes] = None,
+    dry_run: bool = False,
+) -> Tuple[int, int, int, int]:
+    """
+    Deconstruct Report Layout (pages, visuals, filters) and secondary metadata
+    (DiagramLayout, LinguisticSchema, Settings, Metadata).
+    """
+    created, updated, skipped, errors = 0, 0, 0, 0
+
+    # 1. Report Layout
+    if layout_bytes:
+        parser = ReportLayoutParser(layout_bytes)
+        layout_res = parser.extract_artifacts()
+        if layout_res:
+            # Full pretty layout
+            try:
+                rel = "Report_Extracted/Layout_Pretty.json"
+                dest = os.path.join(target_dir, rel)
+                c, u, s = write_file_delta(dest, layout_res["layout_pretty"].encode("utf-8"), rel, dry_run=dry_run)
+                created += c; updated += u; skipped += s
+            except Exception as e:
+                errors += 1
+                print(f"  [SKIPPED - ERROR] Could not write Layout_Pretty.json: {e}", file=sys.stderr)
+
+            # Decompose per page & visuals
+            pages = layout_res.get("pages", {})
+            for p_key, p_data in pages.items():
+                p_meta = p_data.get("metadata", {})
+                p_visuals = p_data.get("visuals", [])
+
+                # Page definition
+                page_rel = f"Report_Extracted/Pages/{p_key}/page.json"
+                dest_p = os.path.join(target_dir, page_rel)
+                try:
+                    c, u, s = write_file_delta(dest_p, json.dumps(p_meta, indent=2).encode("utf-8"), page_rel, dry_run=dry_run)
+                    created += c; updated += u; skipped += s
+                except Exception as e:
+                    errors += 1
+                    print(f"  [SKIPPED - ERROR] Could not write page definition '{p_key}': {e}", file=sys.stderr)
+
+                # Individual visuals
+                for v_idx, vis in enumerate(p_visuals):
+                    v_type = sanitize_filename(vis.get("visualType", "visual"))
+                    v_id = vis.get("id", v_idx)
+                    vis_rel = f"Report_Extracted/Pages/{p_key}/Visuals/{v_idx+1:02d}_{v_type}_{v_id}.json"
+                    dest_v = os.path.join(target_dir, vis_rel)
+                    try:
+                        c, u, s = write_file_delta(dest_v, json.dumps(vis, indent=2).encode("utf-8"), vis_rel, dry_run=dry_run)
+                        created += c; updated += u; skipped += s
+                    except Exception as e:
+                        errors += 1
+                        print(f"  [SKIPPED - ERROR] Could not write visual '{v_id}': {e}", file=sys.stderr)
+
+    # 2. DiagramLayout
+    if diagram_bytes:
+        try:
+            diag_text = decode_text_auto(diagram_bytes)
+            diag_json = json.loads(diag_text)
+            rel = "Report_Extracted/DiagramLayout_Pretty.json"
+            dest = os.path.join(target_dir, rel)
+            c, u, s = write_file_delta(dest, json.dumps(diag_json, indent=2).encode("utf-8"), rel, dry_run=dry_run)
+            created += c; updated += u; skipped += s
+        except Exception as e:
+            errors += 1
+            print(f"  [SKIPPED - ERROR] Could not decompile DiagramLayout: {e}", file=sys.stderr)
+
+    # 3. LinguisticSchema (XML)
+    if linguistic_bytes:
+        try:
+            rel = "Report_Extracted/LinguisticSchema_Pretty.xml"
+            dest = os.path.join(target_dir, rel)
+            p_xml = pretty_xml(linguistic_bytes)
+            c, u, s = write_file_delta(dest, p_xml.encode("utf-8"), rel, dry_run=dry_run)
+            created += c; updated += u; skipped += s
+        except Exception as e:
+            errors += 1
+            print(f"  [SKIPPED - ERROR] Could not decompile LinguisticSchema: {e}", file=sys.stderr)
+
+    # 4. Settings (JSON)
+    if settings_bytes:
+        try:
+            sett_text = decode_text_auto(settings_bytes)
+            sett_json = json.loads(sett_text)
+            rel = "Report_Extracted/Settings_Pretty.json"
+            dest = os.path.join(target_dir, rel)
+            c, u, s = write_file_delta(dest, json.dumps(sett_json, indent=2).encode("utf-8"), rel, dry_run=dry_run)
+            created += c; updated += u; skipped += s
+        except Exception:
+            pass
+
+    # 5. Metadata (JSON)
+    if metadata_bytes:
+        try:
+            meta_text = decode_text_auto(metadata_bytes)
+            meta_json = json.loads(meta_text)
+            rel = "Report_Extracted/Metadata_Pretty.json"
+            dest = os.path.join(target_dir, rel)
+            c, u, s = write_file_delta(dest, json.dumps(meta_json, indent=2).encode("utf-8"), rel, dry_run=dry_run)
+            created += c; updated += u; skipped += s
+        except Exception:
+            pass
+
+    return (created, updated, skipped, errors)
+
+
 def unpack_single_pbix(
     pbix_path: str,
     dry_run: bool = False,
     parse_mashup: bool = True,
     parse_schema: bool = True,
+    parse_report: bool = True,
 ) -> Tuple[int, int, int, int]:
     """
     Unpack a single .pbix or .pbit file into a folder with the same base name.
-    Extracts DataMashup (Power Query M) and DataModelSchema (TMSL JSON) if present.
+    Extracts DataMashup (Power Query M), DataModelSchema (TMSL JSON), and
+    Report artifacts (Layout pages, visuals, DiagramLayout, LinguisticSchema) if present.
     
     Returns:
         (created_count, updated_count, skipped_count, error_count)
@@ -394,6 +510,11 @@ def unpack_single_pbix(
 
     datamashup_bytes: Optional[bytes] = None
     datamodelschema_bytes: Optional[bytes] = None
+    layout_bytes: Optional[bytes] = None
+    diagram_bytes: Optional[bytes] = None
+    linguistic_bytes: Optional[bytes] = None
+    settings_bytes: Optional[bytes] = None
+    metadata_bytes: Optional[bytes] = None
 
     try:
         with zipfile.ZipFile(pbix_path, "r") as zf:
@@ -417,6 +538,16 @@ def unpack_single_pbix(
                         datamashup_bytes = content_bytes
                     elif rel_path in ("DataModelSchema", "DataModelSchema.json"):
                         datamodelschema_bytes = content_bytes
+                    elif rel_path == "Report/Layout":
+                        layout_bytes = content_bytes
+                    elif rel_path == "DiagramLayout":
+                        diagram_bytes = content_bytes
+                    elif rel_path == "Report/LinguisticSchema":
+                        linguistic_bytes = content_bytes
+                    elif rel_path == "Settings":
+                        settings_bytes = content_bytes
+                    elif rel_path == "Metadata":
+                        metadata_bytes = content_bytes
 
                     c, u, s = write_file_delta(dest_file_path, content_bytes, rel_path, dry_run=dry_run)
                     created_count += c
@@ -454,6 +585,24 @@ def unpack_single_pbix(
             error_count += se
         else:
             print("  [NOTE] No DataModelSchema entry in this file (standard in .pbit templates; .pbix files store raw VertiPaq in DataModel).")
+
+    # 3. Deep Report Layout & Secondary Artifacts extraction
+    if parse_report:
+        if layout_bytes or diagram_bytes or linguistic_bytes:
+            print("  -> Decompiling Report Artifacts (Pages, Visuals, Diagrams, Linguistic Schema)...")
+            rc, ru, rs, re = extract_report_artifacts(
+                target_dir=target_dir,
+                layout_bytes=layout_bytes,
+                diagram_bytes=diagram_bytes,
+                linguistic_bytes=linguistic_bytes,
+                settings_bytes=settings_bytes,
+                metadata_bytes=metadata_bytes,
+                dry_run=dry_run,
+            )
+            created_count += rc
+            updated_count += ru
+            skipped_count += rs
+            error_count += re
 
     action_label = "Dry-run summary" if dry_run else "Unpacked"
     error_note = f", {error_count} failed/skipped" if error_count > 0 else ""
@@ -508,7 +657,7 @@ def find_pbix_files(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Unpack PBIX and PBIT files into folders maintaining internal tree structure with delta sync, DataMashup & DataModelSchema deconstruction."
+        description="Unpack PBIX and PBIT files into folders with delta sync, DataMashup, DataModelSchema & Report Layout deconstruction."
     )
     parser.add_argument(
         "-p", "--path",
@@ -551,6 +700,11 @@ def parse_args() -> argparse.Namespace:
         help="Disable deep extraction of DataModelSchema (TMSL JSON and DAX measures)."
     )
     parser.add_argument(
+        "--no-report",
+        action="store_true",
+        help="Disable deep extraction of Report Layout (pages, visuals, diagrams)."
+    )
+    parser.add_argument(
         "-n", "--dry-run",
         action="store_true",
         help="Simulate the unpacking without modifying files."
@@ -590,6 +744,7 @@ def main() -> int:
             dry_run=args.dry_run,
             parse_mashup=(not args.no_mashup),
             parse_schema=(not args.no_schema),
+            parse_report=(not args.no_report),
         )
         total_created += c
         total_updated += u
