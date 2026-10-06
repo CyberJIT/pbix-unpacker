@@ -7,17 +7,21 @@ after the base name of each .pbix file in the same directory, maintaining intern
 folder hierarchies, and only replacing files if they are new or have different contents.
 
 Supports recursive scanning, file name filters (include/exclude), folder name filters (include/exclude),
-Windows extended-length paths (\\\\?\\) and short 8.3 path fallbacks, and graceful error recovery.
+Windows extended-length paths (\\\\?\\) and short 8.3 path fallbacks, graceful error recovery,
+and deep parsing of DataMashup (MS-QDEFF) into Power Query (M) scripts and configuration files.
 """
 
 import argparse
 import ctypes
 import fnmatch
 import hashlib
+import json
 import os
 import sys
 import zipfile
 from typing import List, Optional, Tuple
+
+from mashup_parser import DataMashupParser
 
 
 def normalize_long_path(path: str) -> str:
@@ -62,7 +66,6 @@ def ensure_directory(dir_path: str) -> None:
     try:
         os.makedirs(dir_path, exist_ok=True)
     except (OSError, FileNotFoundError) as err:
-        # Check if Windows path length or similar error
         if os.name == "nt":
             long_p = normalize_long_path(dir_path)
             try:
@@ -168,7 +171,6 @@ def write_file_safe(dest_file_path: str, content_bytes: bytes) -> None:
         with open(dest_file_path, "wb") as dst_stream:
             dst_stream.write(content_bytes)
     except OSError as err:
-        # Long path or file system error fallback on Windows
         if os.name == "nt":
             long_p = normalize_long_path(dest_file_path)
             try:
@@ -188,11 +190,123 @@ def write_file_safe(dest_file_path: str, content_bytes: bytes) -> None:
         raise err
 
 
+def write_file_delta(dest_file_path: str, content_bytes: bytes, rel_path: str, dry_run: bool = False) -> Tuple[int, int, int]:
+    """
+    Write file only if new or different content.
+    Returns (created, updated, skipped).
+    """
+    src_hash = hashlib.sha256(content_bytes).hexdigest()
+
+    if file_exists_safe(dest_file_path):
+        dest_size = get_path_size(dest_file_path)
+        if dest_size == len(content_bytes):
+            dest_hash = calculate_file_sha256(dest_file_path)
+            if dest_hash == src_hash:
+                return (0, 0, 1)
+
+        if not dry_run:
+            write_file_safe(dest_file_path, content_bytes)
+        status_prefix = "[DRY-RUN UPDATED]" if dry_run else "[UPDATED]"
+        print(f"  {status_prefix} {rel_path}")
+        return (0, 1, 0)
+    else:
+        if not dry_run:
+            write_file_safe(dest_file_path, content_bytes)
+        status_prefix = "[DRY-RUN CREATED]" if dry_run else "[CREATED]"
+        print(f"  {status_prefix} {rel_path}")
+        return (1, 0, 0)
+
+
+def sanitize_filename(name: str) -> str:
+    """Sanitize string for safe usage as a cross-platform filename."""
+    return re.sub(r'[\\/*?:"<>|]', "_", name).strip()
+
+
+def extract_datamashup_artifacts(
+    target_dir: str, mashup_bytes: bytes, dry_run: bool = False
+) -> Tuple[int, int, int, int]:
+    """
+    Deconstruct DataMashup into Power Query (M) code and settings files.
+    Places artifacts under target_dir/DataMashup_Extracted/.
+    
+    Returns (created, updated, skipped, errors)
+    """
+    created, updated, skipped, errors = 0, 0, 0, 0
+    mashup_dir = os.path.join(target_dir, "DataMashup_Extracted")
+
+    parser = DataMashupParser(mashup_bytes)
+    artifacts = parser.extract_artifacts()
+    if not artifacts:
+        return (0, 0, 0, 0)
+
+    # 1. Full Section1.m
+    if artifacts.get("section1_m"):
+        try:
+            rel = "DataMashup_Extracted/Section1.m"
+            dest = os.path.join(target_dir, rel)
+            c, u, s = write_file_delta(dest, artifacts["section1_m"].encode("utf-8"), rel, dry_run=dry_run)
+            created += c; updated += u; skipped += s
+        except Exception as e:
+            errors += 1
+            print(f"  [SKIPPED - ERROR] Could not write Section1.m: {e}", file=sys.stderr)
+
+    # 2. Decomposed individual query files
+    queries = artifacts.get("queries", {})
+    if queries:
+        queries_dir = os.path.join(target_dir, "DataMashup_Extracted", "Queries")
+        for q_name, q_code in queries.items():
+            safe_name = sanitize_filename(q_name)
+            rel = f"DataMashup_Extracted/Queries/{safe_name}.m"
+            dest = os.path.join(target_dir, rel)
+            try:
+                c, u, s = write_file_delta(dest, q_code.encode("utf-8"), rel, dry_run=dry_run)
+                created += c; updated += u; skipped += s
+            except Exception as e:
+                errors += 1
+                print(f"  [SKIPPED - ERROR] Could not write query '{q_name}': {e}", file=sys.stderr)
+
+    # 3. Settings & Configuration XML / JSON
+    settings_items = [
+        ("Package.xml", artifacts.get("package_xml")),
+        ("Permissions.xml", artifacts.get("permissions_xml")),
+        ("Metadata.xml", artifacts.get("metadata_xml")),
+    ]
+    for filename, xml_val in settings_items:
+        if xml_val:
+            rel = f"DataMashup_Extracted/{filename}"
+            dest = os.path.join(target_dir, rel)
+            try:
+                c, u, s = write_file_delta(dest, xml_val.encode("utf-8"), rel, dry_run=dry_run)
+                created += c; updated += u; skipped += s
+            except Exception as e:
+                errors += 1
+                print(f"  [SKIPPED - ERROR] Could not write {filename}: {e}", file=sys.stderr)
+
+    # 4. Metadata summary JSON (query groups, load flags, descriptions)
+    meta_summary = artifacts.get("metadata_summary")
+    if meta_summary and meta_summary.get("items"):
+        rel = "DataMashup_Extracted/Metadata_Summary.json"
+        dest = os.path.join(target_dir, rel)
+        try:
+            json_bytes = json.dumps(meta_summary, indent=2).encode("utf-8")
+            c, u, s = write_file_delta(dest, json_bytes, rel, dry_run=dry_run)
+            created += c; updated += u; skipped += s
+        except Exception as e:
+            errors += 1
+            print(f"  [SKIPPED - ERROR] Could not write Metadata_Summary.json: {e}", file=sys.stderr)
+
+    return (created, updated, skipped, errors)
+
+
+import re
+
+
 def unpack_single_pbix(
-    pbix_path: str, dry_run: bool = False
+    pbix_path: str, dry_run: bool = False, parse_mashup: bool = True
 ) -> Tuple[int, int, int, int]:
     """
     Unpack a single .pbix file into a folder with the same base name.
+    Optionally unpacks DataMashup into Power Query M and settings.
     
     Returns:
         (created_count, updated_count, skipped_count, error_count)
@@ -213,14 +327,14 @@ def unpack_single_pbix(
         print(f"  [ERROR] Not a valid zip/pbix archive: {pbix_path}", file=sys.stderr)
         return (0, 0, 0, 1)
 
+    datamashup_bytes: Optional[bytes] = None
+
     try:
         with zipfile.ZipFile(pbix_path, "r") as zf:
             for zip_info in zf.infolist():
-                # Skip directory entries
                 if zip_info.is_dir() or zip_info.filename.endswith("/"):
                     continue
 
-                # Protect against zip slip / path traversal
                 rel_path = os.path.normpath(zip_info.filename)
                 if rel_path.startswith("..") or os.path.isabs(rel_path):
                     print(f"  [WARN] Skipping unsafe zip path: {zip_info.filename}")
@@ -229,33 +343,17 @@ def unpack_single_pbix(
                 dest_file_path = os.path.join(target_dir, rel_path)
 
                 try:
-                    # Read content & compute hash of archive stream
                     with zf.open(zip_info) as src_stream:
                         content_bytes = src_stream.read()
-                    src_hash = hashlib.sha256(content_bytes).hexdigest()
 
-                    if file_exists_safe(dest_file_path):
-                        # Fast check on length then SHA256
-                        dest_size = get_path_size(dest_file_path)
-                        if dest_size == zip_info.file_size:
-                            dest_hash = calculate_file_sha256(dest_file_path)
-                            if dest_hash == src_hash:
-                                skipped_count += 1
-                                continue
+                    # Intercept DataMashup for deep extraction
+                    if rel_path == "DataMashup":
+                        datamashup_bytes = content_bytes
 
-                        # Content differs -> update
-                        if not dry_run:
-                            write_file_safe(dest_file_path, content_bytes)
-                        updated_count += 1
-                        status_prefix = "[DRY-RUN UPDATED]" if dry_run else "[UPDATED]"
-                        print(f"  {status_prefix} {rel_path}")
-                    else:
-                        # New file
-                        if not dry_run:
-                            write_file_safe(dest_file_path, content_bytes)
-                        created_count += 1
-                        status_prefix = "[DRY-RUN CREATED]" if dry_run else "[CREATED]"
-                        print(f"  {status_prefix} {rel_path}")
+                    c, u, s = write_file_delta(dest_file_path, content_bytes, rel_path, dry_run=dry_run)
+                    created_count += c
+                    updated_count += u
+                    skipped_count += s
 
                 except Exception as file_err:
                     error_count += 1
@@ -264,6 +362,15 @@ def unpack_single_pbix(
     except Exception as exc:
         print(f"  [ERROR] Failed to unpack {pbix_path}: {exc}", file=sys.stderr)
         return (created_count, updated_count, skipped_count, error_count + 1)
+
+    # Deep DataMashup extraction if present
+    if parse_mashup and datamashup_bytes:
+        print("  -> Decompiling DataMashup (Power Query M & Settings)...")
+        mc, mu, ms, me = extract_datamashup_artifacts(target_dir, datamashup_bytes, dry_run=dry_run)
+        created_count += mc
+        updated_count += mu
+        skipped_count += ms
+        error_count += me
 
     action_label = "Dry-run summary" if dry_run else "Unpacked"
     error_note = f", {error_count} failed/skipped" if error_count > 0 else ""
@@ -316,7 +423,7 @@ def find_pbix_files(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Unpack PBIX files into folders maintaining internal tree structure with change detection and long-path resilience."
+        description="Unpack PBIX files into folders maintaining internal tree structure with change detection, DataMashup deconstruction, and long-path resilience."
     )
     parser.add_argument(
         "-p", "--path",
@@ -347,6 +454,11 @@ def parse_args() -> argparse.Namespace:
         "--folder-exclude",
         nargs="+",
         help="When searching folders recursively, skip folders containing any of these strings/patterns."
+    )
+    parser.add_argument(
+        "--no-mashup",
+        action="store_true",
+        help="Disable deep extraction of DataMashup (Power Query M and settings)."
     )
     parser.add_argument(
         "-n", "--dry-run",
@@ -383,7 +495,11 @@ def main() -> int:
     total_errors = 0
 
     for pbix in matched_pbix:
-        c, u, s, e = unpack_single_pbix(pbix, dry_run=args.dry_run)
+        c, u, s, e = unpack_single_pbix(
+            pbix,
+            dry_run=args.dry_run,
+            parse_mashup=(not args.no_mashup)
+        )
         total_created += c
         total_updated += u
         total_skipped += s

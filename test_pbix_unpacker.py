@@ -125,5 +125,72 @@ class TestPbixUnpacker(unittest.TestCase):
         self.assertNotIn("sub_c_draft.pbix", found_basenames) # file excluded
 
 
+    def test_datamashup_extraction(self):
+        import io, struct
+        # Construct mock MS-QDEFF DataMashup
+        pkg_buf = io.BytesIO()
+        with zipfile.ZipFile(pkg_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("Config/Package.xml", "<Package><Version>2.120.0</Version><Culture>en-US</Culture></Package>")
+            section1 = """section Section1;
+
+shared #"Customers" = let
+    Source = Csv.Document(File.Contents("customers.csv"))
+in
+    Source;
+
+shared Orders = let
+    Source = Sql.Database("server", "db")
+in
+    Source;
+"""
+            zf.writestr("Formulas/Section1.m", section1)
+        pkg_bytes = pkg_buf.getvalue()
+
+        perm_xml = b"<PermissionList><FirewallEnabled>true</FirewallEnabled></PermissionList>"
+        meta_xml = b"""<LocalPackageMetadataFile xmlns="http://schemas.microsoft.com/DataMashup">
+  <Items>
+    <Item>
+      <ItemLocation><ItemType>Formula</ItemType><ItemPath>Section1/Customers</ItemPath></ItemLocation>
+      <StableEntries>
+        <Entry Type="AddedToDataModel" Value="l1" />
+        <Entry Type="Description" Value="sAll customer records" />
+      </StableEntries>
+    </Item>
+  </Items>
+</LocalPackageMetadataFile>"""
+        meta_stream = struct.pack("<II", 0, len(meta_xml)) + meta_xml + struct.pack("<I", 0)
+        bindings_bytes = b""
+
+        mashup_bytes = (
+            struct.pack("<II", 0, len(pkg_bytes))
+            + pkg_bytes
+            + struct.pack("<I", len(perm_xml))
+            + perm_xml
+            + struct.pack("<I", len(meta_stream))
+            + meta_stream
+            + struct.pack("<I", len(bindings_bytes))
+            + bindings_bytes
+        )
+
+        pbix_path = self._create_pbix("SalesModel.pbix", {"DataMashup": mashup_bytes})
+        c, u, s, e = unpack_single_pbix(pbix_path)
+        self.assertEqual(e, 0)
+        self.assertGreater(c, 0)
+
+        extracted_dir = os.path.join(self.test_dir, "SalesModel")
+        # Check that DataMashup raw and extracted artifacts exist
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataMashup")))
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataMashup_Extracted", "Section1.m")))
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataMashup_Extracted", "Queries", "Customers.m")))
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataMashup_Extracted", "Queries", "Orders.m")))
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataMashup_Extracted", "Package.xml")))
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataMashup_Extracted", "Permissions.xml")))
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataMashup_Extracted", "Metadata_Summary.json")))
+
+        with open(os.path.join(extracted_dir, "DataMashup_Extracted", "Queries", "Customers.m"), "r") as f:
+            content = f.read()
+            self.assertIn('shared #"Customers"', content)
+
+
 if __name__ == "__main__":
     unittest.main()
