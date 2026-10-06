@@ -191,6 +191,68 @@ in
             content = f.read()
             self.assertIn('shared #"Customers"', content)
 
+    def test_datamodelschema_extraction(self):
+        import json
+        sample_tmsl = {
+            "name": "Model",
+            "compatibilityLevel": 1550,
+            "model": {
+                "culture": "en-US",
+                "tables": [
+                    {
+                        "name": "Sales",
+                        "columns": [{"name": "Amount", "dataType": "decimal"}],
+                        "measures": [
+                            {
+                                "name": "Total Sales",
+                                "expression": "SUM(Sales[Amount])",
+                                "formatString": "$#,0.00",
+                                "description": "Sum of sales amount"
+                            }
+                        ],
+                        "partitions": [
+                            {
+                                "name": "Sales-Partition",
+                                "mode": "import",
+                                "source": {
+                                    "type": "m",
+                                    "expression": "let Source = Sql.Database(\"server\", \"db\") in Source"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "relationships": [
+                    {
+                        "name": "rel_sales_date",
+                        "fromTable": "Sales",
+                        "fromColumn": "DateKey",
+                        "toTable": "Date",
+                        "toColumn": "DateKey"
+                    }
+                ]
+            }
+        }
+        # UTF-16LE encoded schema
+        schema_bytes = json.dumps(sample_tmsl).encode("utf-16le")
+
+        pbit_path = self._create_pbix("TemplateReport.pbit", {"DataModelSchema": schema_bytes})
+        c, u, s, e = unpack_single_pbix(pbit_path)
+        self.assertEqual(e, 0)
+        self.assertGreater(c, 0)
+
+        extracted_dir = os.path.join(self.test_dir, "TemplateReport")
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataModelSchema")))
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataModelSchema_Extracted", "DataModelSchema_Pretty.json")))
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataModelSchema_Extracted", "Tables", "Sales.json")))
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataModelSchema_Extracted", "Measures", "Sales", "Total Sales.dax")))
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataModelSchema_Extracted", "Partitions", "Sales_Sales-Partition.m")))
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataModelSchema_Extracted", "Relationships.json")))
+
+        with open(os.path.join(extracted_dir, "DataModelSchema_Extracted", "Measures", "Sales", "Total Sales.dax"), "r") as f:
+            dax_content = f.read()
+            self.assertIn("SUM(Sales[Amount])", dax_content)
+
 
 if __name__ == "__main__":
     unittest.main()

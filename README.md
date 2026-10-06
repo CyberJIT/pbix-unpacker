@@ -1,6 +1,6 @@
-# PBIX Unpacker (Python & PowerShell)
+# PBIX & PBIT Unpacker (Python & PowerShell)
 
-A lightweight utility to extract `.pbix` (Power BI Desktop) files as ZIP archives into sibling folders named after the report's base name. It preserves internal folder structures, verifies file hashes (SHA-256) to update **only** modified or new files, decompiles the embedded **DataMashup** binary stream into plain-text Power Query (M) code and settings, and supports flexible filtering and recursion.
+A lightweight utility to extract `.pbix` and `.pbit` (Power BI Desktop & Template) files as ZIP archives into sibling folders named after the report's base name. It preserves internal folder structures, verifies file hashes (SHA-256) to update **only** modified or new files, decompiles the embedded **DataMashup** binary stream into plain-text Power Query (M) code and settings, deconstructs **DataModelSchema** (TMSL JSON) into tables, partitions, and DAX measures, and supports flexible filtering and recursion.
 
 ---
 
@@ -13,10 +13,15 @@ A lightweight utility to extract `.pbix` (Power BI Desktop) files as ZIP archive
   - Extracts `Formulas/Section1.m` and deconstructs it into individual `.m` files per query under `DataMashup_Extracted/Queries/<QueryName>.m`.
   - Pretty-prints configuration files (`Package.xml`, `Permissions.xml`, `Metadata.xml`).
   - Generates `Metadata_Summary.json` mapping query descriptions, query group IDs, and load-to-model status flags.
+- **DataModelSchema Deconstruction (TMSL JSON & DAX Measures)**:
+  - Supports `.pbit` templates and modern packages containing `DataModelSchema`.
+  - Pretty-prints `DataModelSchema_Pretty.json`.
+  - Decomposes all **DAX measures** into standalone `.dax` files categorized by table under `DataModelSchema_Extracted/Measures/<Table>/<Measure>.dax`.
+  - Extracts table metadata, model partitions (embedded M queries), and relationships JSON.
 - **Content-Aware Delta Updates**: Checks file size and SHA-256 checksums to avoid touching unchanged files.
-- **Recursive Directory Traversal**: Optional recursive search across nested folders.
+- **Recursive Directory Traversal**: Optional recursive search across nested folders for `.pbix` and `.pbit` files.
 - **Granular Filtering**:
-  - Filter in / out `.pbix` files by substring or wildcard.
+  - Filter in / out files by substring or wildcard.
   - Filter in / out subdirectories during recursion by substring or wildcard.
 - **Long Path Support & Short-Name Fallback**: Automatic support for Windows extended-length paths (`\\?\`) and 8.3 short-name workarounds (`GetShortPathNameW`) to bypass `MAX_PATH` limitations.
 - **Graceful Error Recovery**: If an individual file fails due to an insurmountable path or permission error, it logs the failure and continues unpacking remaining files instead of aborting the process.
@@ -24,47 +29,48 @@ A lightweight utility to extract `.pbix` (Power BI Desktop) files as ZIP archive
 
 ---
 
-## 1. Python Tool (`pbix_unpacker.py` & `mashup_parser.py`)
+## 1. Python Tool (`pbix_unpacker.py`, `mashup_parser.py`, `schema_parser.py`)
 
 Requires Python 3.7+ (pure standard library, zero external dependencies).
 
 ### Usage
 
 ```bash
-# Basic unpack of a single folder (with automatic DataMashup deconstruction)
-python3 pbix_unpacker.py -p "/path/to/pbix_folder"
+# Basic unpack of a folder (automatic DataMashup & DataModelSchema deconstruction)
+python3 pbix_unpacker.py -p "/path/to/reports"
 
 # Recursive scan under subdirectories
-python3 pbix_unpacker.py -p "/path/to/pbix_folder" -r
+python3 pbix_unpacker.py -p "/path/to/reports" -r
 
-# Filter pbix files (e.g. include 'Finance' or 'Sales', exclude 'Draft')
-python3 pbix_unpacker.py -p "/path/to/pbix_folder" -r \
+# Filter reports (e.g. include 'Finance' or 'Sales', exclude 'Draft')
+python3 pbix_unpacker.py -p "/path/to/reports" -r \
   --file-include "*Finance*" "*Sales*" \
   --file-exclude "*Draft*"
 
 # Filter folders to traverse (e.g. only folders containing '2025', skip 'Archive')
-python3 pbix_unpacker.py -p "/path/to/pbix_folder" -r \
+python3 pbix_unpacker.py -p "/path/to/reports" -r \
   --folder-include "2025" \
   --folder-exclude "Archive" "Old"
 
-# Skip deep DataMashup deconstruction (raw archive extraction only)
-python3 pbix_unpacker.py -p "/path/to/pbix_folder" --no-mashup
+# Skip deep deconstruction if raw archive unpacking is desired
+python3 pbix_unpacker.py -p "/path/to/reports" --no-mashup --no-schema
 
 # Dry run simulation
-python3 pbix_unpacker.py -p "/path/to/pbix_folder" -r --dry-run
+python3 pbix_unpacker.py -p "/path/to/reports" -r --dry-run
 ```
 
 ### CLI Parameters
 
 | Flag | Full Option | Description |
 | :--- | :--- | :--- |
-| `-p` | `--path` | **(Required)** Path to target directory containing `.pbix` files. |
-| `-r` | `--recursive` | Recursively search subdirectories for `.pbix` files. |
-| | `--file-include` | One or more patterns/substrings to include `.pbix` files. |
-| | `--file-exclude` | One or more patterns/substrings to exclude `.pbix` files. |
+| `-p` | `--path` | **(Required)** Path to target directory containing `.pbix`/`.pbit` files. |
+| `-r` | `--recursive` | Recursively search subdirectories for `.pbix`/`.pbit` files. |
+| | `--file-include` | One or more patterns/substrings to include files. |
+| | `--file-exclude` | One or more patterns/substrings to exclude files. |
 | | `--folder-include` | One or more patterns/substrings to allow folders during recursion. |
 | | `--folder-exclude` | One or more patterns/substrings to prune folders during recursion. |
 | | `--no-mashup` | Skip deep parsing and extraction of `DataMashup`. |
+| | `--no-schema` | Skip deep parsing and extraction of `DataModelSchema`. |
 | `-n` | `--dry-run` | Preview actions without creating or replacing files. |
 
 ---
@@ -76,13 +82,13 @@ Compatible with Windows PowerShell 5.1+ and PowerShell 7+ (Core / macOS / Linux)
 ### Usage
 
 ```powershell
-# Basic unpack (with automatic DataMashup deconstruction)
+# Basic unpack (with automatic DataMashup & DataModelSchema deconstruction)
 .\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports"
 
 # Recursive scan
 .\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports" -Recurse
 
-# Filter pbix files
+# Filter reports
 .\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports" -Recurse `
   -FileInclude "Finance*", "Sales*" `
   -FileExclude "*Draft*"
@@ -92,8 +98,8 @@ Compatible with Windows PowerShell 5.1+ and PowerShell 7+ (Core / macOS / Linux)
   -FolderInclude "2025" `
   -FolderExclude "Archive", "Old"
 
-# Skip deep DataMashup deconstruction
-.\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports" -NoMashup
+# Skip deep deconstruction
+.\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports" -NoMashup -NoSchema
 
 # Dry run simulation
 .\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports" -Recurse -DryRun
@@ -103,41 +109,54 @@ Compatible with Windows PowerShell 5.1+ and PowerShell 7+ (Core / macOS / Linux)
 
 | Parameter | Type | Description |
 | :--- | :--- | :--- |
-| `-Path` | `String` | **(Required)** Path to directory containing `.pbix` files. |
+| `-Path` | `String` | **(Required)** Path to directory containing `.pbix`/`.pbit` files. |
 | `-Recurse` | `Switch` | Search subdirectories recursively. |
-| `-FileInclude` | `String[]` | List of substrings or wildcards to include `.pbix` files. |
-| `-FileExclude` | `String[]` | List of substrings or wildcards to skip `.pbix` files. |
+| `-FileInclude` | `String[]` | List of substrings or wildcards to include files. |
+| `-FileExclude` | `String[]` | List of substrings or wildcards to skip files. |
 | `-FolderInclude` | `String[]` | List of substrings or wildcards of folders to traverse. |
 | `-FolderExclude` | `String[]` | List of substrings or wildcards of folders to skip. |
 | `-NoMashup` | `Switch` | Skip deep parsing and extraction of `DataMashup`. |
+| `-NoSchema` | `Switch` | Skip deep parsing and extraction of `DataModelSchema`. |
 | `-DryRun` | `Switch` | Preview operations without touching disk files. |
 
 ---
 
 ## Output Structure
 
-When unpacking a report `Sales.pbix`, the resulting directory will be organized as follows:
+When unpacking reports, the resulting folders will contain:
 
 ```text
-Sales/
+Report/
 ├── [Content_Types].xml
 ├── Connections
-├── DataModel
+├── DataModel                   <- Raw VertiPaq / Analysis Services backup (in .pbix)
+├── DataModelSchema             <- Raw TMSL JSON (in .pbit)
 ├── DiagramLayout
 ├── Settings
 ├── Version
 ├── Report/
 │   └── Layout
-└── DataMashup_Extracted/
-    ├── Section1.m                  <- Full Power Query formula document
-    ├── Package.xml                 <- Version and culture settings
-    ├── Permissions.xml             <- Data source privacy/firewall settings
-    ├── Metadata.xml                <- Raw query metadata entries
-    ├── Metadata_Summary.json       <- Structured JSON of query descriptions & flags
-    └── Queries/                    <- Deconstructed individual query scripts
-        ├── Customers.m
-        ├── Orders.m
-        └── DateTable.m
+├── DataMashup_Extracted/       <- Extracted Power Query M and settings
+│   ├── Section1.m
+│   ├── Package.xml
+│   ├── Permissions.xml
+│   ├── Metadata.xml
+│   ├── Metadata_Summary.json
+│   └── Queries/
+│       ├── Customers.m
+│       └── Orders.m
+└── DataModelSchema_Extracted/  <- Extracted TMSL model definitions
+    ├── DataModelSchema_Pretty.json
+    ├── Relationships.json
+    ├── Tables/
+    │   ├── Sales.json
+    │   └── Date.json
+    ├── Partitions/
+    │   └── Sales_SalesPartition.m
+    └── Measures/
+        └── Sales/
+            ├── Total Sales.dax
+            └── Sales YTD.dax
 ```
 
 ---
@@ -147,10 +166,10 @@ Sales/
 | Capability | Python (3.7+ stdlib) | PowerShell (.NET Framework / Core) |
 | :--- | :--- | :--- |
 | **MS-QDEFF Binary Decompilation** | Fully supported (`struct`, `io.BytesIO`) | Fully supported (`BinaryReader`, `MemoryStream`) |
-| **Package ZIP Extraction** | Fully supported (`zipfile`) | Fully supported (`ZipArchive`) |
-| **Section1.m Query Splitting** | Fully supported (`re`) | Fully supported (`[regex]`) |
-| **XML Settings Formatting** | Fully supported (`xml.dom.minidom`) | Fully supported (`XDocument`) |
-| **External Dependencies Required** | **None** (zero third-party packages) | **None** (standard .NET BCL assemblies) |
+| **DataModelSchema TMSL JSON** | Fully supported (`json`, UTF-16LE auto-decode) | Fully supported (`ConvertFrom-Json`) |
+| **DAX Measures Deconstruction** | Fully supported | Fully supported |
+| **M Partitions Extraction** | Fully supported | Fully supported |
+| **Third-Party Dependencies** | **None** (zero pip installs) | **None** (standard .NET assemblies) |
 
 ---
 

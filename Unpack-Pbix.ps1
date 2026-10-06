@@ -1,31 +1,28 @@
 <#
 .SYNOPSIS
-    Unpacks .pbix files into folders, maintaining internal tree structure, delta synchronization,
-    and deep deconstruction of Power Query DataMashup (MS-QDEFF) files into M code and settings.
+    Unpacks .pbix and .pbit files into folders, maintaining internal tree structure, delta synchronization,
+    and deep deconstruction of Power Query DataMashup (MS-QDEFF) and DataModelSchema (TMSL JSON).
 
 .DESCRIPTION
-    Takes all .pbix files in a specified folder, treats them as zip archives, and unzips their contents
-    into a subfolder named like the base name of the .pbix file located in the same directory.
+    Takes all .pbix and .pbit files in a specified folder, treats them as zip archives, and unzips their contents
+    into a subfolder named like the base name of each file located in the same directory.
     Compares existing files using SHA256 hashes and file lengths to avoid redundant writes.
-    Parses and decompiles the DataMashup binary file according to MS-QDEFF:
-      - Extracts embedded Package zip (Section1.m, Config/Package.xml, etc.)
-      - Decomposes Section1.m into individual query files (.m)
-      - Formats Permissions.xml and Metadata.xml settings
-      - Generates Metadata_Summary.json mapping query properties
+    Decompiles DataMashup (Power Query M formulas, queries, XML settings).
+    Decompiles DataModelSchema (TMSL JSON, tables, partitions, relationships, DAX measures).
     Supports recursive discovery, file name filtering (include/exclude), folder filtering (include/exclude),
     long path extended prefixes (\\?\), Win32 short 8.3 path fallbacks, and graceful error reporting.
 
 .PARAMETER Path
-    Target directory containing .pbix files.
+    Target directory containing .pbix/.pbit files.
 
 .PARAMETER Recurse
-    Recursively search for .pbix files in subdirectories.
+    Recursively search for files in subdirectories.
 
 .PARAMETER FileInclude
-    Array of string fragments or wildcards to include matching pbix file names.
+    Array of string fragments or wildcards to include matching file names.
 
 .PARAMETER FileExclude
-    Array of string fragments or wildcards to exclude matching pbix file names.
+    Array of string fragments or wildcards to exclude matching file names.
 
 .PARAMETER FolderInclude
     Array of string fragments or wildcards to include matching folder names during recursive search.
@@ -35,6 +32,9 @@
 
 .PARAMETER NoMashup
     Disable deep deconstruction of DataMashup (Power Query M and settings).
+
+.PARAMETER NoSchema
+    Disable deep deconstruction of DataModelSchema (TMSL JSON and DAX measures).
 
 .PARAMETER DryRun
     Simulate execution without modifying the filesystem.
@@ -67,6 +67,9 @@ param(
 
     [Parameter(Mandatory = $false)]
     [switch]$NoMashup,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$NoSchema,
 
     [Parameter(Mandatory = $false)]
     [switch]$DryRun
@@ -375,6 +378,28 @@ function Split-MQueries {
     return $queries
 }
 
+function Decode-SchemaString {
+    param([byte[]]$Bytes)
+    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE) {
+        return [System.Text.Encoding]::Unicode.GetString($Bytes)
+    }
+    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFE -and $Bytes[1] -eq 0xFF) {
+        return [System.Text.Encoding]::BigEndianUnicode.GetString($Bytes)
+    }
+    if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) {
+        return [System.Text.Encoding]::UTF8.GetString($Bytes)
+    }
+    if ($Bytes.Length -ge 2 -and $Bytes[1] -eq 0) {
+        return [System.Text.Encoding]::Unicode.GetString($Bytes)
+    }
+    try {
+        return [System.Text.Encoding]::UTF8.GetString($Bytes)
+    }
+    catch {
+        return [System.Text.Encoding]::Unicode.GetString($Bytes)
+    }
+}
+
 function Expand-DataMashupBinary {
     param(
         [Parameter(Mandatory = $true)][string]$TargetDir,
@@ -420,13 +445,11 @@ function Expand-DataMashupBinary {
                         $mText = $sReader.ReadToEnd()
                         $sReader.Dispose()
 
-                        # Write full Section1.m
                         $rel = "DataMashup_Extracted/Section1.m"
                         $dest = [System.IO.Path]::Combine($TargetDir, $rel)
                         $r = Write-DeltaFile -DestFilePath $dest -Bytes ([System.Text.Encoding]::UTF8.GetBytes($mText)) -RelPath $rel -IsDryRun $IsDryRun
                         $created += $r.Created; $updated += $r.Updated; $skipped += $r.Skipped
 
-                        # Decompose individual queries
                         $queries = Split-MQueries -SectionText $mText
                         foreach ($qName in $queries.Keys) {
                             $safeName = Get-SanitizedFileName -FileName $qName
@@ -493,6 +516,100 @@ function Expand-DataMashupBinary {
     return [PSCustomObject]@{ Created = $created; Updated = $updated; Skipped = $skipped; Errors = $errors }
 }
 
+function Expand-DataModelSchemaBinary {
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetDir,
+        [Parameter(Mandatory = $true)][byte[]]$SchemaBytes,
+        [Parameter(Mandatory = $false)][bool]$IsDryRun = $false
+    )
+
+    $created = 0; $updated = 0; $skipped = 0; $errors = 0
+
+    try {
+        $jsonStr = Decode-SchemaString -Bytes $SchemaBytes
+        $schemaObj = $jsonStr | ConvertFrom-Json
+
+        if (-not $schemaObj) { return [PSCustomObject]@{ Created=0; Updated=0; Skipped=0; Errors=0 } }
+
+        # 1. Pretty JSON
+        $prettyJson = $schemaObj | ConvertTo-Json -Depth 100
+        $rel = "DataModelSchema_Extracted/DataModelSchema_Pretty.json"
+        $dest = [System.IO.Path]::Combine($TargetDir, $rel)
+        $r = Write-DeltaFile -DestFilePath $dest -Bytes ([System.Text.Encoding]::UTF8.GetBytes($prettyJson)) -RelPath $rel -IsDryRun $IsDryRun
+        $created += $r.Created; $updated += $r.Updated; $skipped += $r.Skipped
+
+        $model = if ($schemaObj.PSObject.Properties['model']) { $schemaObj.model } else { $schemaObj }
+
+        # 2. Decompose Tables & Measures
+        if ($model.PSObject.Properties['tables'] -and $model.tables) {
+            foreach ($tbl in $model.tables) {
+                $tName = if ($tbl.name) { $tbl.name } else { "UnnamedTable" }
+                $safeT = Get-SanitizedFileName -FileName $tName
+
+                # Write Table metadata
+                $tJson = $tbl | ConvertTo-Json -Depth 50
+                $tRel = "DataModelSchema_Extracted/Tables/$safeT.json"
+                $tDest = [System.IO.Path]::Combine($TargetDir, $tRel)
+                $tr = Write-DeltaFile -DestFilePath $tDest -Bytes ([System.Text.Encoding]::UTF8.GetBytes($tJson)) -RelPath $tRel -IsDryRun $IsDryRun
+                $created += $tr.Created; $updated += $tr.Updated; $skipped += $tr.Skipped
+
+                # Measures
+                if ($tbl.PSObject.Properties['measures'] -and $tbl.measures) {
+                    foreach ($m in $tbl.measures) {
+                        $mName = if ($m.name) { $m.name } else { "UnnamedMeasure" }
+                        $safeM = Get-SanitizedFileName -FileName $mName
+                        $expr = if ($m.expression -is [array]) { $m.expression -join "`n" } else { [string]$m.expression }
+
+                        $mContent = "// Table: $tName`n// Measure: $mName`n"
+                        if ($m.PSObject.Properties['description'] -and $m.description) {
+                            $mContent += "// Description: $($m.description)`n"
+                        }
+                        if ($m.PSObject.Properties['formatString'] -and $m.formatString) {
+                            $mContent += "// FormatString: $($m.formatString)`n"
+                        }
+                        $mContent += "`n$expr`n"
+
+                        $mRel = "DataModelSchema_Extracted/Measures/$safeT/$safeM.dax"
+                        $mDest = [System.IO.Path]::Combine($TargetDir, $mRel)
+                        $mr = Write-DeltaFile -DestFilePath $mDest -Bytes ([System.Text.Encoding]::UTF8.GetBytes($mContent)) -RelPath $mRel -IsDryRun $IsDryRun
+                        $created += $mr.Created; $updated += $mr.Updated; $skipped += $mr.Skipped
+                    }
+                }
+
+                # Partitions & M expressions
+                if ($tbl.PSObject.Properties['partitions'] -and $tbl.partitions) {
+                    foreach ($p in $tbl.partitions) {
+                        if ($p.PSObject.Properties['source'] -and $p.source -and $p.source.PSObject.Properties['type'] -and $p.source.type.ToString().ToLower() -eq 'm') {
+                            $pExpr = if ($p.source.expression -is [array]) { $p.source.expression -join "`n" } else { [string]$p.source.expression }
+                            $pName = if ($p.name) { $p.name } else { "$safeT`_Partition" }
+                            $safeP = Get-SanitizedFileName -FileName "$safeT`_$pName"
+                            $pRel = "DataModelSchema_Extracted/Partitions/$safeP.m"
+                            $pDest = [System.IO.Path]::Combine($TargetDir, $pRel)
+                            $pr = Write-DeltaFile -DestFilePath $pDest -Bytes ([System.Text.Encoding]::UTF8.GetBytes($pExpr)) -RelPath $pRel -IsDryRun $IsDryRun
+                            $created += $pr.Created; $updated += $pr.Updated; $skipped += $pr.Skipped
+                        }
+                    }
+                }
+            }
+        }
+
+        # 3. Relationships
+        if ($model.PSObject.Properties['relationships'] -and $model.relationships) {
+            $relJson = $model.relationships | ConvertTo-Json -Depth 50
+            $rRel = "DataModelSchema_Extracted/Relationships.json"
+            $rDest = [System.IO.Path]::Combine($TargetDir, $rRel)
+            $rr = Write-DeltaFile -DestFilePath $rDest -Bytes ([System.Text.Encoding]::UTF8.GetBytes($relJson)) -RelPath $rRel -IsDryRun $IsDryRun
+            $created += $rr.Created; $updated += $rr.Updated; $skipped += $rr.Skipped
+        }
+    }
+    catch {
+        $errors++
+        Write-Host "  [SKIPPED - ERROR] Could not decompile DataModelSchema: $_" -ForegroundColor Red
+    }
+
+    return [PSCustomObject]@{ Created = $created; Updated = $updated; Skipped = $skipped; Errors = $errors }
+}
+
 function Expand-PbixFile {
     param(
         [Parameter(Mandatory = $true)]
@@ -502,7 +619,10 @@ function Expand-PbixFile {
         [bool]$IsDryRun = $false,
 
         [Parameter(Mandatory = $false)]
-        [bool]$ParseMashup = $true
+        [bool]$ParseMashup = $true,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$ParseSchema = $true
     )
 
     $parentDir = [System.IO.Path]::GetDirectoryName($PbixPath)
@@ -517,6 +637,7 @@ function Expand-PbixFile {
     $skipped = 0
     $errors = 0
     $mashupBytes = $null
+    $schemaBytes = $null
 
     $zipArchive = $null
     try {
@@ -556,6 +677,9 @@ function Expand-PbixFile {
                 if ($entryRelPath -eq "DataMashup") {
                     $mashupBytes = $bytes
                 }
+                elseif ($entryRelPath -eq "DataModelSchema" -or $entryRelPath -eq "DataModelSchema.json") {
+                    $schemaBytes = $bytes
+                }
 
                 $r = Write-DeltaFile -DestFilePath $destFilePath -Bytes $bytes -RelPath $entryRelPath -IsDryRun $IsDryRun
                 $created += $r.Created
@@ -574,7 +698,7 @@ function Expand-PbixFile {
         }
     }
 
-    # Deep DataMashup extraction if present
+    # 1. Deep DataMashup extraction
     if ($ParseMashup) {
         if ($null -ne $mashupBytes) {
             Write-Host "  -> Decompiling DataMashup (Power Query M & Settings)..." -ForegroundColor Cyan
@@ -585,7 +709,22 @@ function Expand-PbixFile {
             $errors += $mr.Errors
         }
         else {
-            Write-Host "  [NOTE] No DataMashup entry in this PBIX (e.g. Live Connection, Direct Lake, or purely cloud-hosted semantic model)." -ForegroundColor DarkGray
+            Write-Host "  [NOTE] No DataMashup entry in this file (e.g. Live Connection or Direct Lake)." -ForegroundColor DarkGray
+        }
+    }
+
+    # 2. Deep DataModelSchema extraction
+    if ($ParseSchema) {
+        if ($null -ne $schemaBytes) {
+            Write-Host "  -> Decompiling DataModelSchema (TMSL JSON, DAX Measures & Tables)..." -ForegroundColor Cyan
+            $sr = Expand-DataModelSchemaBinary -TargetDir $targetDir -SchemaBytes $schemaBytes -IsDryRun $IsDryRun
+            $created += $sr.Created
+            $updated += $sr.Updated
+            $skipped += $sr.Skipped
+            $errors += $sr.Errors
+        }
+        else {
+            Write-Host "  [NOTE] No DataModelSchema entry in this file (standard in .pbit templates; .pbix files store raw VertiPaq in DataModel)." -ForegroundColor DarkGray
         }
     }
 
@@ -607,11 +746,12 @@ if (-not (Test-Path -LiteralPath $resolvedPath -PathType Container)) {
     throw "Specified path does not exist or is not a directory: $resolvedPath"
 }
 
-# Collect PBIX files
+# Collect PBIX & PBIT files
 $discoveredFiles = [System.Collections.Generic.List[string]]::new()
+$validExtFilter = { $_.Extension -eq '.pbix' -or $_.Extension -eq '.pbit' }
 
 if (-not $Recurse) {
-    Get-ChildItem -LiteralPath $resolvedPath -File -Filter "*.pbix" | ForEach-Object {
+    Get-ChildItem -LiteralPath $resolvedPath -File | Where-Object $validExtFilter | ForEach-Object {
         if (Test-IncludeItem -Name $_.Name -IncludePatterns $FileInclude -ExcludePatterns $FileExclude) {
             $discoveredFiles.Add($_.FullName)
         }
@@ -624,7 +764,7 @@ else {
     while ($foldersQueue.Count -gt 0) {
         $currentFolder = $foldersQueue.Dequeue()
 
-        Get-ChildItem -LiteralPath $currentFolder -File -Filter "*.pbix" | ForEach-Object {
+        Get-ChildItem -LiteralPath $currentFolder -File | Where-Object $validExtFilter | ForEach-Object {
             if (Test-IncludeItem -Name $_.Name -IncludePatterns $FileInclude -ExcludePatterns $FileExclude) {
                 $discoveredFiles.Add($_.FullName)
             }
@@ -639,11 +779,11 @@ else {
 }
 
 if ($discoveredFiles.Count -eq 0) {
-    Write-Host "No matching .pbix files found in '$resolvedPath'." -ForegroundColor Yellow
+    Write-Host "No matching .pbix/.pbit files found in '$resolvedPath'." -ForegroundColor Yellow
     exit 0
 }
 
-Write-Host "Found $($discoveredFiles.Count) matching .pbix file(s)." -ForegroundColor Green
+Write-Host "Found $($discoveredFiles.Count) matching file(s)." -ForegroundColor Green
 
 $totalCreated = 0
 $totalUpdated = 0
@@ -651,7 +791,7 @@ $totalSkipped = 0
 $totalErrors  = 0
 
 foreach ($file in $discoveredFiles) {
-    $res = Expand-PbixFile -PbixPath $file -IsDryRun $DryRun.IsPresent -ParseMashup (-not $NoMashup.IsPresent)
+    $res = Expand-PbixFile -PbixPath $file -IsDryRun $DryRun.IsPresent -ParseMashup (-not $NoMashup.IsPresent) -ParseSchema (-not $NoSchema.IsPresent)
     $totalCreated += $res.Created
     $totalUpdated += $res.Updated
     $totalSkipped += $res.Skipped
@@ -660,7 +800,7 @@ foreach ($file in $discoveredFiles) {
 
 Write-Host "`n==================================================" -ForegroundColor Cyan
 Write-Host "Summary:" -ForegroundColor Cyan
-Write-Host "  PBIX files processed : $($discoveredFiles.Count)"
+Write-Host "  Files processed      : $($discoveredFiles.Count)"
 Write-Host "  Files created        : $totalCreated"
 Write-Host "  Files updated        : $totalUpdated"
 Write-Host "  Files unchanged      : $totalSkipped"

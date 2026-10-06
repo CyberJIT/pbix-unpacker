@@ -2,13 +2,14 @@
 """
 pbix_unpacker.py
 
-A tool to extract .pbix files (treated as zip archives) into subfolders named
-after the base name of each .pbix file in the same directory, maintaining internal
-folder hierarchies, and only replacing files if they are new or have different contents.
+A tool to extract .pbix and .pbit files (treated as zip archives) into subfolders named
+after the base name of each file in the same directory, maintaining internal folder
+hierarchies, and only replacing files if they are new or have different contents.
 
 Supports recursive scanning, file name filters (include/exclude), folder name filters (include/exclude),
 Windows extended-length paths (\\\\?\\) and short 8.3 path fallbacks, graceful error recovery,
-and deep parsing of DataMashup (MS-QDEFF) into Power Query (M) scripts and configuration files.
+deep parsing of DataMashup (MS-QDEFF) into Power Query (M) scripts, and decompilation of
+DataModelSchema (TMSL JSON) into measures, tables, partitions, and relationships.
 """
 
 import argparse
@@ -17,11 +18,13 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import sys
 import zipfile
 from typing import List, Optional, Tuple
 
 from mashup_parser import DataMashupParser
+from schema_parser import DataModelSchemaParser, decode_schema_bytes
 
 
 def normalize_long_path(path: str) -> str:
@@ -36,16 +39,12 @@ def normalize_long_path(path: str) -> str:
     if abs_path.startswith("\\\\?\\"):
         return abs_path
     if abs_path.startswith("\\\\"):
-        # UNC path: \\server\share -> \\?\UNC\server\share
         return "\\\\?\\UNC\\" + abs_path[2:]
     return "\\\\?\\" + abs_path
 
 
 def get_short_path_name(long_name: str) -> Optional[str]:
-    """
-    Retrieve Windows 8.3 short path equivalent using GetShortPathNameW API.
-    Returns None if not on Windows or if short path generation is disabled/unavailable.
-    """
+    """Retrieve Windows 8.3 short path equivalent using GetShortPathNameW API."""
     if os.name != "nt":
         return None
     try:
@@ -60,9 +59,7 @@ def get_short_path_name(long_name: str) -> Optional[str]:
 
 
 def ensure_directory(dir_path: str) -> None:
-    """
-    Create directory ensuring support for long paths and short path workarounds.
-    """
+    """Create directory ensuring support for long paths and short path workarounds."""
     try:
         os.makedirs(dir_path, exist_ok=True)
     except (OSError, FileNotFoundError) as err:
@@ -123,10 +120,7 @@ def file_exists_safe(filepath: str) -> bool:
 
 
 def matches_patterns(name: str, patterns: Optional[List[str]]) -> bool:
-    """
-    Check if a name contains any pattern as a substring (case-insensitive)
-    or matches a wildcard pattern.
-    """
+    """Check if a name contains any pattern as a substring or wildcard."""
     if not patterns:
         return False
     name_lower = name.lower()
@@ -146,12 +140,7 @@ def should_include_name(
     include_patterns: Optional[List[str]],
     exclude_patterns: Optional[List[str]],
 ) -> bool:
-    """
-    Evaluate inclusion/exclusion rules for a given file or folder name.
-    1. If exclude patterns are given and name matches, exclude.
-    2. If include patterns are given, name must match at least one.
-    3. Otherwise include.
-    """
+    """Evaluate inclusion/exclusion rules for a given file or folder name."""
     if exclude_patterns and matches_patterns(name, exclude_patterns):
         return False
     if include_patterns and not matches_patterns(name, include_patterns):
@@ -160,10 +149,7 @@ def should_include_name(
 
 
 def write_file_safe(dest_file_path: str, content_bytes: bytes) -> None:
-    """
-    Write bytes to destination file, using extended long paths or short path
-    equivalents if standard open fails.
-    """
+    """Write bytes to destination file with long-path resilience."""
     dest_dir = os.path.dirname(dest_file_path)
     ensure_directory(dest_dir)
 
@@ -191,10 +177,7 @@ def write_file_safe(dest_file_path: str, content_bytes: bytes) -> None:
 
 
 def write_file_delta(dest_file_path: str, content_bytes: bytes, rel_path: str, dry_run: bool = False) -> Tuple[int, int, int]:
-    """
-    Write file only if new or different content.
-    Returns (created, updated, skipped).
-    """
+    """Write file only if new or different content. Returns (created, updated, skipped)."""
     src_hash = hashlib.sha256(content_bytes).hexdigest()
 
     if file_exists_safe(dest_file_path):
@@ -225,15 +208,8 @@ def sanitize_filename(name: str) -> str:
 def extract_datamashup_artifacts(
     target_dir: str, mashup_bytes: bytes, dry_run: bool = False
 ) -> Tuple[int, int, int, int]:
-    """
-    Deconstruct DataMashup into Power Query (M) code and settings files.
-    Places artifacts under target_dir/DataMashup_Extracted/.
-    
-    Returns (created, updated, skipped, errors)
-    """
+    """Deconstruct DataMashup into Power Query (M) code and settings files."""
     created, updated, skipped, errors = 0, 0, 0, 0
-    mashup_dir = os.path.join(target_dir, "DataMashup_Extracted")
-
     parser = DataMashupParser(mashup_bytes)
     artifacts = parser.extract_artifacts()
     if not artifacts:
@@ -253,7 +229,6 @@ def extract_datamashup_artifacts(
     # 2. Decomposed individual query files
     queries = artifacts.get("queries", {})
     if queries:
-        queries_dir = os.path.join(target_dir, "DataMashup_Extracted", "Queries")
         for q_name, q_code in queries.items():
             safe_name = sanitize_filename(q_name)
             rel = f"DataMashup_Extracted/Queries/{safe_name}.m"
@@ -265,7 +240,7 @@ def extract_datamashup_artifacts(
                 errors += 1
                 print(f"  [SKIPPED - ERROR] Could not write query '{q_name}': {e}", file=sys.stderr)
 
-    # 3. Settings & Configuration XML / JSON
+    # 3. Settings & Configuration XML
     settings_items = [
         ("Package.xml", artifacts.get("package_xml")),
         ("Permissions.xml", artifacts.get("permissions_xml")),
@@ -282,7 +257,7 @@ def extract_datamashup_artifacts(
                 errors += 1
                 print(f"  [SKIPPED - ERROR] Could not write {filename}: {e}", file=sys.stderr)
 
-    # 4. Metadata summary JSON (query groups, load flags, descriptions)
+    # 4. Metadata summary JSON
     meta_summary = artifacts.get("metadata_summary")
     if meta_summary and meta_summary.get("items"):
         rel = "DataMashup_Extracted/Metadata_Summary.json"
@@ -298,15 +273,105 @@ def extract_datamashup_artifacts(
     return (created, updated, skipped, errors)
 
 
-import re
+def extract_datamodelschema_artifacts(
+    target_dir: str, schema_bytes: bytes, dry_run: bool = False
+) -> Tuple[int, int, int, int]:
+    """
+    Deconstruct DataModelSchema (TMSL JSON) into formatted model,
+    tables metadata, partitions (M queries), and individual DAX measure files.
+    """
+    created, updated, skipped, errors = 0, 0, 0, 0
+    parser = DataModelSchemaParser(schema_bytes)
+    artifacts = parser.extract_artifacts()
+    if not artifacts:
+        return (0, 0, 0, 0)
+
+    # 1. Pretty-printed schema JSON
+    if artifacts.get("formatted_schema_json"):
+        try:
+            rel = "DataModelSchema_Extracted/DataModelSchema_Pretty.json"
+            dest = os.path.join(target_dir, rel)
+            c, u, s = write_file_delta(dest, artifacts["formatted_schema_json"].encode("utf-8"), rel, dry_run=dry_run)
+            created += c; updated += u; skipped += s
+        except Exception as e:
+            errors += 1
+            print(f"  [SKIPPED - ERROR] Could not write DataModelSchema_Pretty.json: {e}", file=sys.stderr)
+
+    # 2. Decomposed DAX Measures
+    measures = artifacts.get("measures", {})
+    if measures:
+        for m_key, m_info in measures.items():
+            tbl_name = sanitize_filename(m_info["table"])
+            meas_name = sanitize_filename(m_info["name"])
+            rel = f"DataModelSchema_Extracted/Measures/{tbl_name}/{meas_name}.dax"
+            dest = os.path.join(target_dir, rel)
+            m_content = f"// Table: {m_info['table']}\n// Measure: {m_info['name']}\n"
+            if m_info.get("description"):
+                m_content += f"// Description: {m_info['description']}\n"
+            if m_info.get("format_string"):
+                m_content += f"// FormatString: {m_info['format_string']}\n"
+            m_content += f"\n{m_info['expression']}\n"
+            try:
+                c, u, s = write_file_delta(dest, m_content.encode("utf-8"), rel, dry_run=dry_run)
+                created += c; updated += u; skipped += s
+            except Exception as e:
+                errors += 1
+                print(f"  [SKIPPED - ERROR] Could not write DAX measure '{meas_name}': {e}", file=sys.stderr)
+
+    # 3. Table definitions
+    tables = artifacts.get("tables", {})
+    if tables:
+        for t_name, t_meta in tables.items():
+            safe_t = sanitize_filename(t_name)
+            rel = f"DataModelSchema_Extracted/Tables/{safe_t}.json"
+            dest = os.path.join(target_dir, rel)
+            try:
+                t_bytes = json.dumps(t_meta, indent=2).encode("utf-8")
+                c, u, s = write_file_delta(dest, t_bytes, rel, dry_run=dry_run)
+                created += c; updated += u; skipped += s
+            except Exception as e:
+                errors += 1
+                print(f"  [SKIPPED - ERROR] Could not write table metadata '{safe_t}': {e}", file=sys.stderr)
+
+    # 4. M Partitions (Power Query source code inside Model tables)
+    m_partitions = artifacts.get("m_partitions", {})
+    if m_partitions:
+        for p_name, p_code in m_partitions.items():
+            safe_p = sanitize_filename(p_name)
+            rel = f"DataModelSchema_Extracted/Partitions/{safe_p}.m"
+            dest = os.path.join(target_dir, rel)
+            try:
+                c, u, s = write_file_delta(dest, p_code.encode("utf-8"), rel, dry_run=dry_run)
+                created += c; updated += u; skipped += s
+            except Exception as e:
+                errors += 1
+                print(f"  [SKIPPED - ERROR] Could not write M partition '{safe_p}': {e}", file=sys.stderr)
+
+    # 5. Relationships
+    relationships = artifacts.get("relationships", [])
+    if relationships:
+        rel = "DataModelSchema_Extracted/Relationships.json"
+        dest = os.path.join(target_dir, rel)
+        try:
+            r_bytes = json.dumps(relationships, indent=2).encode("utf-8")
+            c, u, s = write_file_delta(dest, r_bytes, rel, dry_run=dry_run)
+            created += c; updated += u; skipped += s
+        except Exception as e:
+            errors += 1
+            print(f"  [SKIPPED - ERROR] Could not write Relationships.json: {e}", file=sys.stderr)
+
+    return (created, updated, skipped, errors)
 
 
 def unpack_single_pbix(
-    pbix_path: str, dry_run: bool = False, parse_mashup: bool = True
+    pbix_path: str,
+    dry_run: bool = False,
+    parse_mashup: bool = True,
+    parse_schema: bool = True,
 ) -> Tuple[int, int, int, int]:
     """
-    Unpack a single .pbix file into a folder with the same base name.
-    Optionally unpacks DataMashup into Power Query M and settings.
+    Unpack a single .pbix or .pbit file into a folder with the same base name.
+    Extracts DataMashup (Power Query M) and DataModelSchema (TMSL JSON) if present.
     
     Returns:
         (created_count, updated_count, skipped_count, error_count)
@@ -324,10 +389,11 @@ def unpack_single_pbix(
     print(f"Target directory: {target_dir}")
 
     if not zipfile.is_zipfile(pbix_path):
-        print(f"  [ERROR] Not a valid zip/pbix archive: {pbix_path}", file=sys.stderr)
+        print(f"  [ERROR] Not a valid zip/pbix/pbit archive: {pbix_path}", file=sys.stderr)
         return (0, 0, 0, 1)
 
     datamashup_bytes: Optional[bytes] = None
+    datamodelschema_bytes: Optional[bytes] = None
 
     try:
         with zipfile.ZipFile(pbix_path, "r") as zf:
@@ -346,9 +412,11 @@ def unpack_single_pbix(
                     with zf.open(zip_info) as src_stream:
                         content_bytes = src_stream.read()
 
-                    # Intercept DataMashup for deep extraction
+                    # Intercept special files for deep deconstruction
                     if rel_path == "DataMashup":
                         datamashup_bytes = content_bytes
+                    elif rel_path in ("DataModelSchema", "DataModelSchema.json"):
+                        datamodelschema_bytes = content_bytes
 
                     c, u, s = write_file_delta(dest_file_path, content_bytes, rel_path, dry_run=dry_run)
                     created_count += c
@@ -363,7 +431,7 @@ def unpack_single_pbix(
         print(f"  [ERROR] Failed to unpack {pbix_path}: {exc}", file=sys.stderr)
         return (created_count, updated_count, skipped_count, error_count + 1)
 
-    # Deep DataMashup extraction if present
+    # 1. Deep DataMashup extraction
     if parse_mashup:
         if datamashup_bytes:
             print("  -> Decompiling DataMashup (Power Query M & Settings)...")
@@ -373,7 +441,19 @@ def unpack_single_pbix(
             skipped_count += ms
             error_count += me
         else:
-            print("  [NOTE] No DataMashup entry in this PBIX (e.g. Live Connection, Direct Lake, or purely cloud-hosted semantic model).")
+            print("  [NOTE] No DataMashup entry in this file (e.g. Live Connection or Direct Lake).")
+
+    # 2. Deep DataModelSchema extraction
+    if parse_schema:
+        if datamodelschema_bytes:
+            print("  -> Decompiling DataModelSchema (TMSL JSON, DAX Measures & Tables)...")
+            sc, su, ss, se = extract_datamodelschema_artifacts(target_dir, datamodelschema_bytes, dry_run=dry_run)
+            created_count += sc
+            updated_count += su
+            skipped_count += ss
+            error_count += se
+        else:
+            print("  [NOTE] No DataModelSchema entry in this file (standard in .pbit templates; .pbix files store raw VertiPaq in DataModel).")
 
     action_label = "Dry-run summary" if dry_run else "Unpacked"
     error_note = f", {error_count} failed/skipped" if error_count > 0 else ""
@@ -389,16 +469,18 @@ def find_pbix_files(
     folder_include: Optional[List[str]],
     folder_exclude: Optional[List[str]],
 ) -> List[str]:
-    """Discover all .pbix files adhering to path, recursion, and inclusion/exclusion filters."""
+    """Discover all .pbix and .pbit files adhering to path, recursion, and inclusion/exclusion filters."""
     root_folder = os.path.abspath(root_folder)
     pbix_files: List[str] = []
 
     if not os.path.isdir(root_folder):
         raise ValueError(f"Root path is not a directory: {root_folder}")
 
+    valid_exts = (".pbix", ".pbit")
+
     if not recursive:
         for entry in os.listdir(root_folder):
-            if entry.lower().endswith(".pbix") and os.path.isfile(os.path.join(root_folder, entry)):
+            if entry.lower().endswith(valid_exts) and os.path.isfile(os.path.join(root_folder, entry)):
                 if should_include_name(entry, file_include, file_exclude):
                     pbix_files.append(os.path.join(root_folder, entry))
         return sorted(pbix_files)
@@ -417,7 +499,7 @@ def find_pbix_files(
         ]
 
         for file_name in files:
-            if file_name.lower().endswith(".pbix"):
+            if file_name.lower().endswith(valid_exts):
                 if should_include_name(file_name, file_include, file_exclude):
                     pbix_files.append(os.path.join(current_dir, file_name))
 
@@ -426,27 +508,27 @@ def find_pbix_files(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Unpack PBIX files into folders maintaining internal tree structure with change detection, DataMashup deconstruction, and long-path resilience."
+        description="Unpack PBIX and PBIT files into folders maintaining internal tree structure with delta sync, DataMashup & DataModelSchema deconstruction."
     )
     parser.add_argument(
         "-p", "--path",
         required=True,
-        help="Target folder containing .pbix files."
+        help="Target folder containing .pbix/.pbit files."
     )
     parser.add_argument(
         "-r", "--recursive",
         action="store_true",
-        help="Recursively scan subfolders for .pbix files."
+        help="Recursively scan subfolders for .pbix/.pbit files."
     )
     parser.add_argument(
         "--file-include",
         nargs="+",
-        help="Only process .pbix files whose names contain any of these strings/patterns."
+        help="Only process files whose names contain any of these strings/patterns."
     )
     parser.add_argument(
         "--file-exclude",
         nargs="+",
-        help="Skip .pbix files whose names contain any of these strings/patterns."
+        help="Skip files whose names contain any of these strings/patterns."
     )
     parser.add_argument(
         "--folder-include",
@@ -462,6 +544,11 @@ def parse_args() -> argparse.Namespace:
         "--no-mashup",
         action="store_true",
         help="Disable deep extraction of DataMashup (Power Query M and settings)."
+    )
+    parser.add_argument(
+        "--no-schema",
+        action="store_true",
+        help="Disable deep extraction of DataModelSchema (TMSL JSON and DAX measures)."
     )
     parser.add_argument(
         "-n", "--dry-run",
@@ -488,10 +575,10 @@ def main() -> int:
         return 1
 
     if not matched_pbix:
-        print("No matching .pbix files found.")
+        print("No matching .pbix/.pbit files found.")
         return 0
 
-    print(f"Found {len(matched_pbix)} matching .pbix file(s).")
+    print(f"Found {len(matched_pbix)} matching file(s).")
     total_created = 0
     total_updated = 0
     total_skipped = 0
@@ -501,7 +588,8 @@ def main() -> int:
         c, u, s, e = unpack_single_pbix(
             pbix,
             dry_run=args.dry_run,
-            parse_mashup=(not args.no_mashup)
+            parse_mashup=(not args.no_mashup),
+            parse_schema=(not args.no_schema),
         )
         total_created += c
         total_updated += u
@@ -510,7 +598,7 @@ def main() -> int:
 
     print("\n" + "=" * 50)
     print("Summary:")
-    print(f"  PBIX files processed : {len(matched_pbix)}")
+    print(f"  Files processed      : {len(matched_pbix)}")
     print(f"  Files created        : {total_created}")
     print(f"  Files updated        : {total_updated}")
     print(f"  Files unchanged      : {total_skipped}")
