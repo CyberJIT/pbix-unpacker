@@ -575,13 +575,18 @@ function Expand-PbixFile {
     }
 
     # Deep DataMashup extraction if present
-    if ($ParseMashup -and $null -ne $mashupBytes) {
-        Write-Host "  -> Decompiling DataMashup (Power Query M & Settings)..." -ForegroundColor Cyan
-        $mr = Expand-DataMashupBinary -TargetDir $targetDir -MashupBytes $mashupBytes -IsDryRun $IsDryRun
-        $created += $mr.Created
-        $updated += $mr.Updated
-        $skipped += $mr.Skipped
-        $errors += $mr.Errors
+    if ($ParseMashup) {
+        if ($null -ne $mashupBytes) {
+            Write-Host "  -> Decompiling DataMashup (Power Query M & Settings)..." -ForegroundColor Cyan
+            $mr = Expand-DataMashupBinary -TargetDir $targetDir -MashupBytes $mashupBytes -IsDryRun $IsDryRun
+            $created += $mr.Created
+            $updated += $mr.Updated
+            $skipped += $mr.Skipped
+            $errors += $mr.Errors
+        }
+        else {
+            Write-Host "  [NOTE] No DataMashup entry in this PBIX (e.g. Live Connection, Direct Lake, or purely cloud-hosted semantic model)." -ForegroundColor DarkGray
+        }
     }
 
     $summaryLabel = if ($IsDryRun) { "Dry-run summary" } else { "Unpacked" }

@@ -364,13 +364,16 @@ def unpack_single_pbix(
         return (created_count, updated_count, skipped_count, error_count + 1)
 
     # Deep DataMashup extraction if present
-    if parse_mashup and datamashup_bytes:
-        print("  -> Decompiling DataMashup (Power Query M & Settings)...")
-        mc, mu, ms, me = extract_datamashup_artifacts(target_dir, datamashup_bytes, dry_run=dry_run)
-        created_count += mc
-        updated_count += mu
-        skipped_count += ms
-        error_count += me
+    if parse_mashup:
+        if datamashup_bytes:
+            print("  -> Decompiling DataMashup (Power Query M & Settings)...")
+            mc, mu, ms, me = extract_datamashup_artifacts(target_dir, datamashup_bytes, dry_run=dry_run)
+            created_count += mc
+            updated_count += mu
+            skipped_count += ms
+            error_count += me
+        else:
+            print("  [NOTE] No DataMashup entry in this PBIX (e.g. Live Connection, Direct Lake, or purely cloud-hosted semantic model).")
 
     action_label = "Dry-run summary" if dry_run else "Unpacked"
     error_note = f", {error_count} failed/skipped" if error_count > 0 else ""
