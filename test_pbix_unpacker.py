@@ -49,8 +49,8 @@ class TestPbixUnpacker(unittest.TestCase):
             },
         )
 
-        # 1st run: all files should be created (with parse_report=False for base test)
-        created, updated, skipped, errors = unpack_single_pbix(pbix_path, parse_report=False)
+        # 1st run: all files should be created (with parse_report=False and extract_datamodel=False for base test)
+        created, updated, skipped, errors = unpack_single_pbix(pbix_path, parse_report=False, extract_datamodel=False)
         self.assertEqual(created, 3)
         self.assertEqual(updated, 0)
         self.assertEqual(skipped, 0)
@@ -61,7 +61,7 @@ class TestPbixUnpacker(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(extracted_dir, "Report", "Layout")))
 
         # 2nd run with unchanged pbix: all should be skipped
-        c2, u2, s2, e2 = unpack_single_pbix(pbix_path, parse_report=False)
+        c2, u2, s2, e2 = unpack_single_pbix(pbix_path, parse_report=False, extract_datamodel=False)
         self.assertEqual(c2, 0)
         self.assertEqual(u2, 0)
         self.assertEqual(s2, 3)
@@ -77,7 +77,7 @@ class TestPbixUnpacker(unittest.TestCase):
                 "Metadata/Version": b"1.2.3",          # New
             },
         )
-        c3, u3, s3, e3 = unpack_single_pbix(pbix_path, parse_report=False)
+        c3, u3, s3, e3 = unpack_single_pbix(pbix_path, parse_report=False, extract_datamodel=False)
         self.assertEqual(c3, 1)  # Version created
         self.assertEqual(u3, 1)  # DataModel updated
         self.assertEqual(s3, 2)  # Layout and SecurityBindings skipped
@@ -322,7 +322,39 @@ in
             vis_obj = json.load(f)
             self.assertEqual(vis_obj.get("config", {}).get("singleVisual", {}).get("visualType"), "barChart")
 
+    def test_datamodel_bridge_extraction(self):
+        # Mock ABF payload starting with standard XPress9 backup header in UTF-16LE
+        header_text = "This backup was created using XPress9 compression."
+        abf_payload = header_text.encode("utf-16le") + b"\x00" * 64 + b"MOCK_VERTIPAQ_DATA"
+
+        pbix_path = self._create_pbix("SalesAnalytics.pbix", {"DataModel": abf_payload})
+        c, u, s, e = unpack_single_pbix(pbix_path, extract_datamodel=True)
+        self.assertEqual(e, 0)
+        self.assertGreater(c, 0)
+
+        extracted_dir = os.path.join(self.test_dir, "SalesAnalytics")
+        bridge_dir = os.path.join(extracted_dir, "DataModel_Bridge")
+
+        self.assertTrue(os.path.exists(os.path.join(extracted_dir, "DataModel")))
+        self.assertTrue(os.path.exists(os.path.join(bridge_dir, "DataModel.abf")))
+        self.assertTrue(os.path.exists(os.path.join(bridge_dir, "Restore_Database.xmla")))
+        self.assertTrue(os.path.exists(os.path.join(bridge_dir, "DataModel_Info.json")))
+
+        # Verify XMLA restore script contains target DB name and ABF file path
+        with open(os.path.join(bridge_dir, "Restore_Database.xmla"), "r", encoding="utf-8") as f:
+            xmla_text = f.read()
+            self.assertIn("<DatabaseName>SalesAnalytics</DatabaseName>", xmla_text)
+            self.assertIn("DataModel.abf", xmla_text)
+
+        # Verify DataModel_Info.json recognizes ABF & XPress9
+        with open(os.path.join(bridge_dir, "DataModel_Info.json"), "r", encoding="utf-8") as f:
+            info_obj = json.load(f)
+            self.assertTrue(info_obj["is_analysis_services_backup"])
+            self.assertEqual(info_obj["compression_type"], "XPress9")
+            self.assertIn("recommended_workflows", info_obj)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

@@ -25,6 +25,12 @@ A lightweight utility to extract `.pbix` and `.pbit` (Power BI Desktop & Templat
   - Pretty-prints `DiagramLayout_Pretty.json` (diagram visual coordinates).
   - Formats `LinguisticSchema_Pretty.xml` (Q&A natural language definitions).
   - Formats `Settings_Pretty.json` and `Metadata_Pretty.json`.
+- **DataModel VertiPaq ABF Bridge & Active Port Discovery**:
+  - Automatically identifies the proprietary `DataModel` VertiPaq Analysis Services Backup File (ABF) container and parses the compression header (e.g. `XPress9`).
+  - Generates standalone `DataModel_Bridge/DataModel.abf` ready for direct restoration into any local or remote SSAS Tabular developer instance.
+  - Generates ready-to-execute `DataModel_Bridge/Restore_Database.xmla` targeting SSAS.
+  - Creates `DataModel_Bridge/DataModel_Info.json` outlining model metrics and recommended extraction workflows.
+  - Scans for running Power BI Desktop SSAS (`msmdsrv.exe`) instances via `msmdsrv.port.txt` in `AnalysisServicesWorkspace` and prints connection strings for DAX Studio, Tabular Editor, or ADOMD.NET.
 - **Content-Aware Delta Updates**: Checks file size and SHA-256 checksums to avoid touching unchanged files.
 - **Recursive Directory Traversal**: Optional recursive search across nested folders for `.pbix` and `.pbit` files.
 - **Granular Filtering**:
@@ -36,15 +42,18 @@ A lightweight utility to extract `.pbix` and `.pbit` (Power BI Desktop & Templat
 
 ---
 
-## 1. Python Tool (`pbix_unpacker.py`, `mashup_parser.py`, `schema_parser.py`, `layout_parser.py`)
+## 1. Python Tool (`pbix_unpacker.py`, `mashup_parser.py`, `schema_parser.py`, `layout_parser.py`, `datamodel_bridge.py`)
 
 Requires Python 3.7+ (pure standard library, zero external dependencies).
 
 ### Usage
 
 ```bash
-# Basic unpack of a folder (automatic DataMashup, DataModelSchema & Report visual deconstruction)
+# Basic unpack of a folder (automatic DataMashup, DataModelSchema, Report visuals & DataModel bridge)
 python3 pbix_unpacker.py -p "/path/to/reports"
+
+# Detect active Power BI Desktop local SSAS ports and print connection strings
+python3 pbix_unpacker.py --find-active-ports
 
 # Recursive scan under subdirectories
 python3 pbix_unpacker.py -p "/path/to/reports" -r
@@ -60,7 +69,7 @@ python3 pbix_unpacker.py -p "/path/to/reports" -r \
   --folder-exclude "Archive" "Old"
 
 # Skip deep deconstruction if raw archive unpacking is desired
-python3 pbix_unpacker.py -p "/path/to/reports" --no-mashup --no-schema --no-report
+python3 pbix_unpacker.py -p "/path/to/reports" --no-mashup --no-schema --no-report --no-datamodel
 
 # Dry run simulation
 python3 pbix_unpacker.py -p "/path/to/reports" -r --dry-run
@@ -70,7 +79,7 @@ python3 pbix_unpacker.py -p "/path/to/reports" -r --dry-run
 
 | Flag | Full Option | Description |
 | :--- | :--- | :--- |
-| `-p` | `--path` | **(Required)** Path to target directory containing `.pbix`/`.pbit` files. |
+| `-p` | `--path` | Path to target directory containing `.pbix`/`.pbit` files. |
 | `-r` | `--recursive` | Recursively search subdirectories for `.pbix`/`.pbit` files. |
 | | `--file-include` | One or more patterns/substrings to include files. |
 | | `--file-exclude` | One or more patterns/substrings to exclude files. |
@@ -79,6 +88,8 @@ python3 pbix_unpacker.py -p "/path/to/reports" -r --dry-run
 | | `--no-mashup` | Skip deep parsing and extraction of `DataMashup`. |
 | | `--no-schema` | Skip deep parsing and extraction of `DataModelSchema`. |
 | | `--no-report` | Skip deep parsing and deconstruction of `Report` layout, visuals, and diagrams. |
+| | `--no-datamodel`| Skip DataModel VertiPaq ABF bridge export and XMLA script generation. |
+| | `--find-active-ports` | Scan local machine for active Power BI Desktop SSAS ports and print connection strings. |
 | `-n` | `--dry-run` | Preview actions without creating or replacing files. |
 
 ---
@@ -90,8 +101,11 @@ Compatible with Windows PowerShell 5.1+ and PowerShell 7+ (Core / macOS / Linux)
 ### Usage
 
 ```powershell
-# Basic unpack (with automatic DataMashup, DataModelSchema & Report visual deconstruction)
+# Basic unpack (with automatic DataMashup, DataModelSchema, Report visuals & DataModel bridge)
 .\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports"
+
+# Detect active Power BI Desktop local SSAS ports and print connection strings
+.\Unpack-Pbix.ps1 -FindActivePorts
 
 # Recursive scan
 .\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports" -Recurse
@@ -107,7 +121,7 @@ Compatible with Windows PowerShell 5.1+ and PowerShell 7+ (Core / macOS / Linux)
   -FolderExclude "Archive", "Old"
 
 # Skip deep deconstruction
-.\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports" -NoMashup -NoSchema -NoReport
+.\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports" -NoMashup -NoSchema -NoReport -NoDataModel
 
 # Dry run simulation
 .\Unpack-Pbix.ps1 -Path "C:\PowerBI\Reports" -Recurse -DryRun
@@ -117,7 +131,7 @@ Compatible with Windows PowerShell 5.1+ and PowerShell 7+ (Core / macOS / Linux)
 
 | Parameter | Type | Description |
 | :--- | :--- | :--- |
-| `-Path` | `String` | **(Required)** Path to directory containing `.pbix`/`.pbit` files. |
+| `-Path` | `String` | Path to directory containing `.pbix`/`.pbit` files. |
 | `-Recurse` | `Switch` | Search subdirectories recursively. |
 | `-FileInclude` | `String[]` | List of substrings or wildcards to include files. |
 | `-FileExclude` | `String[]` | List of substrings or wildcards to skip files. |
@@ -126,6 +140,8 @@ Compatible with Windows PowerShell 5.1+ and PowerShell 7+ (Core / macOS / Linux)
 | `-NoMashup` | `Switch` | Skip deep parsing and extraction of `DataMashup`. |
 | `-NoSchema` | `Switch` | Skip deep parsing and extraction of `DataModelSchema`. |
 | `-NoReport` | `Switch` | Skip deep parsing and extraction of `Report` layout, visuals, and diagrams. |
+| `-NoDataModel` | `Switch` | Skip DataModel VertiPaq ABF bridge export and XMLA script generation. |
+| `-FindActivePorts` | `Switch` | Scan local machine for active Power BI Desktop SSAS ports and print connection strings. |
 | `-DryRun` | `Switch` | Preview operations without touching disk files. |
 
 ---
@@ -166,18 +182,22 @@ Report/
 │       └── Sales/
 │           ├── Total Sales.dax
 │           └── Sales YTD.dax
-└── Report_Extracted/           <- Deconstructed visual layout and diagrams
-    ├── Layout_Pretty.json
-    ├── DiagramLayout_Pretty.json
-    ├── LinguisticSchema_Pretty.xml
-    ├── Settings_Pretty.json
-    ├── Metadata_Pretty.json
-    └── Pages/
-        └── 01_Executive Summary/
-            ├── page.json
-            └── Visuals/
-                ├── 01_barChart_visual1.json
-                └── 02_card_visual2.json
+├── Report_Extracted/           <- Deconstructed visual layout and diagrams
+│   ├── Layout_Pretty.json
+│   ├── DiagramLayout_Pretty.json
+│   ├── LinguisticSchema_Pretty.xml
+│   ├── Settings_Pretty.json
+│   ├── Metadata_Pretty.json
+│   └── Pages/
+│       └── 01_Executive Summary/
+│           ├── page.json
+│           └── Visuals/
+│               ├── 01_barChart_visual1.json
+│               └── 02_card_visual2.json
+└── DataModel_Bridge/           <- VertiPaq ABF bridge & hydration scripts
+    ├── DataModel.abf           <- Renamed SSAS backup container
+    ├── Restore_Database.xmla   <- Direct XMLA restore script for SSAS Tabular developer instance
+    └── DataModel_Info.json     <- Model size, compression (XPress9), and live connection guides
 ```
 
 ---
@@ -191,6 +211,8 @@ Report/
 | **DAX Measures Deconstruction** | Fully supported | Fully supported |
 | **Report Layout & Visual Containers** | Fully supported (`layout_parser.py`) | Fully supported (`ConvertFrom-Json`, nested string unwrap) |
 | **Diagram Layout & Linguistic Schema** | Fully supported | Fully supported |
+| **DataModel VertiPaq ABF Bridge & XMLA** | Fully supported (`datamodel_bridge.py`) | Fully supported (`Expand-DataModelBridge`) |
+| **Active SSAS Port Discovery** | Fully supported (`find_active_powerbi_ssas_instances`) | Fully supported (`Get-PowerBiActiveSsasInstances`) |
 | **Third-Party Dependencies** | **None** (zero pip installs) | **None** (standard .NET assemblies) |
 
 ---

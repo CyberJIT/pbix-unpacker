@@ -24,6 +24,11 @@ import sys
 import zipfile
 from typing import List, Optional, Tuple
 
+from datamodel_bridge import (
+    extract_datamodel_bridge,
+    find_active_powerbi_ssas_instances,
+    inspect_abf_header,
+)
 from layout_parser import ReportLayoutParser, decode_text_auto, pretty_xml
 from mashup_parser import DataMashupParser
 from schema_parser import DataModelSchemaParser, decode_schema_bytes
@@ -483,11 +488,13 @@ def unpack_single_pbix(
     parse_mashup: bool = True,
     parse_schema: bool = True,
     parse_report: bool = True,
+    extract_datamodel: bool = True,
 ) -> Tuple[int, int, int, int]:
     """
     Unpack a single .pbix or .pbit file into a folder with the same base name.
-    Extracts DataMashup (Power Query M), DataModelSchema (TMSL JSON), and
-    Report artifacts (Layout pages, visuals, DiagramLayout, LinguisticSchema) if present.
+    Extracts DataMashup (Power Query M), DataModelSchema (TMSL JSON),
+    Report artifacts (Layout pages, visuals, DiagramLayout, LinguisticSchema),
+    and DataModel VertiPaq ABF bridge artifacts (DataModel.abf, Restore.xmla, Info.json) if present.
     
     Returns:
         (created_count, updated_count, skipped_count, error_count)
@@ -510,6 +517,7 @@ def unpack_single_pbix(
 
     datamashup_bytes: Optional[bytes] = None
     datamodelschema_bytes: Optional[bytes] = None
+    datamodel_bytes: Optional[bytes] = None
     layout_bytes: Optional[bytes] = None
     diagram_bytes: Optional[bytes] = None
     linguistic_bytes: Optional[bytes] = None
@@ -538,6 +546,8 @@ def unpack_single_pbix(
                         datamashup_bytes = content_bytes
                     elif rel_path in ("DataModelSchema", "DataModelSchema.json"):
                         datamodelschema_bytes = content_bytes
+                    elif rel_path == "DataModel":
+                        datamodel_bytes = content_bytes
                     elif rel_path == "Report/Layout":
                         layout_bytes = content_bytes
                     elif rel_path == "DiagramLayout":
@@ -604,6 +614,38 @@ def unpack_single_pbix(
             skipped_count += rs
             error_count += re
 
+    # 4. DataModel VertiPaq ABF Bridge (SSAS Restore XMLA, .abf container, metadata)
+    if extract_datamodel:
+        if datamodel_bytes:
+            print("  -> Preparing DataModel VertiPaq ABF Bridge (XMLA Restore & Metadata)...")
+            try:
+                bridge_artifacts = extract_datamodel_bridge(
+                    target_dir=target_dir,
+                    datamodel_bytes=datamodel_bytes,
+                    base_name=base_name,
+                    dry_run=dry_run,
+                )
+                # 4.1 Write DataModel.abf
+                dest_abf = os.path.join(target_dir, bridge_artifacts["abf_rel"])
+                c, u, s = write_file_delta(dest_abf, bridge_artifacts["abf_bytes"], bridge_artifacts["abf_rel"], dry_run=dry_run)
+                created_count += c; updated_count += u; skipped_count += s
+
+                # 4.2 Write XMLA Restore script
+                dest_xmla = os.path.join(target_dir, bridge_artifacts["xmla_rel"])
+                c, u, s = write_file_delta(dest_xmla, bridge_artifacts["xmla_text"].encode("utf-8"), bridge_artifacts["xmla_rel"], dry_run=dry_run)
+                created_count += c; updated_count += u; skipped_count += s
+
+                # 4.3 Write DataModel_Info.json
+                dest_info = os.path.join(target_dir, bridge_artifacts["info_rel"])
+                info_json_bytes = json.dumps(bridge_artifacts["info_dict"], indent=2).encode("utf-8")
+                c, u, s = write_file_delta(dest_info, info_json_bytes, bridge_artifacts["info_rel"], dry_run=dry_run)
+                created_count += c; updated_count += u; skipped_count += s
+            except Exception as b_err:
+                error_count += 1
+                print(f"  [SKIPPED - ERROR] Could not extract DataModel bridge: {b_err}", file=sys.stderr)
+        else:
+            print("  [NOTE] No raw DataModel entry in this file (e.g. .pbit template or live cloud dataset).")
+
     action_label = "Dry-run summary" if dry_run else "Unpacked"
     error_note = f", {error_count} failed/skipped" if error_count > 0 else ""
     print(f"  -> {action_label}: {created_count} created, {updated_count} updated, {skipped_count} unchanged{error_note}.")
@@ -661,7 +703,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "-p", "--path",
-        required=True,
+        required=False,
+        default=None,
         help="Target folder containing .pbix/.pbit files."
     )
     parser.add_argument(
@@ -705,6 +748,16 @@ def parse_args() -> argparse.Namespace:
         help="Disable deep extraction of Report Layout (pages, visuals, diagrams)."
     )
     parser.add_argument(
+        "--no-datamodel",
+        action="store_true",
+        help="Disable DataModel VertiPaq ABF bridge extraction (.abf container, XMLA restore script, info JSON)."
+    )
+    parser.add_argument(
+        "--find-active-ports",
+        action="store_true",
+        help="Detect active Power BI Desktop local SSAS AnalysisServicesWorkspace instances and output connection strings."
+    )
+    parser.add_argument(
         "-n", "--dry-run",
         action="store_true",
         help="Simulate the unpacking without modifying files."
@@ -714,6 +767,24 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    if args.find_active_ports:
+        print("\nSearching for active Power BI Desktop Analysis Services (SSAS) instances...")
+        instances = find_active_powerbi_ssas_instances()
+        if not instances:
+            print("  No active Power BI Desktop SSAS instances found (or running on non-Windows host without mounted AppData).")
+        else:
+            print(f"  Found {len(instances)} active instance(s):")
+            for inst in instances:
+                print(f"    - Port: {inst['port']}")
+                print(f"      Connection: {inst['connection_string']}")
+                print(f"      Workspace:  {inst['workspace_dir']}")
+        if not args.path:
+            return 0
+
+    if not args.path:
+        print("Error: -p / --path is required when not querying active ports.", file=sys.stderr)
+        return 1
 
     try:
         matched_pbix = find_pbix_files(
@@ -745,6 +816,7 @@ def main() -> int:
             parse_mashup=(not args.no_mashup),
             parse_schema=(not args.no_schema),
             parse_report=(not args.no_report),
+            extract_datamodel=(not args.no_datamodel),
         )
         total_created += c
         total_updated += u

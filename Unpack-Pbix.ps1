@@ -79,6 +79,12 @@ param(
     [switch]$NoReport,
 
     [Parameter(Mandatory = $false)]
+    [switch]$NoDataModel,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$FindActivePorts,
+
+    [Parameter(Mandatory = $false)]
     [switch]$DryRun
 )
 
@@ -706,6 +712,147 @@ function Expand-ReportArtifacts {
     return [PSCustomObject]@{ Created = $created; Updated = $updated; Skipped = $skipped; Errors = $errors }
 }
 
+function Get-PowerBiActiveSsasInstances {
+    [CmdletBinding()]
+    param()
+
+    $instances = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $candidateDirs = [System.Collections.Generic.List[string]]::new()
+
+    $localAppData = $env:LOCALAPPDATA
+    if (-not [string]::IsNullOrEmpty($localAppData)) {
+        $candidateDirs.Add([System.IO.Path]::Combine($localAppData, "Microsoft", "Power BI Desktop", "AnalysisServicesWorkspace"))
+    }
+    $userProfile = $env:USERPROFILE
+    if (-not [string]::IsNullOrEmpty($userProfile)) {
+        $candidateDirs.Add([System.IO.Path]::Combine($userProfile, "AppData", "Local", "Microsoft", "Power BI Desktop", "AnalysisServicesWorkspace"))
+    }
+
+    foreach ($baseDir in $candidateDirs) {
+        if (Test-Path -LiteralPath $baseDir -PathType Container) {
+            Get-ChildItem -LiteralPath $baseDir -Recurse -Filter "msmdsrv.port.txt" -File -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    $raw = [System.IO.File]::ReadAllText($_.FullName)
+                    if ($raw -match '(\d+)') {
+                        $port = [int]$matches[1]
+                        $instances.Add([PSCustomObject]@{
+                            Port             = $port
+                            PortFile         = $_.FullName
+                            WorkspaceDir     = $_.DirectoryName
+                            ConnectionString = "Provider=MSOLAP;Data Source=localhost:$port;"
+                        })
+                    }
+                } catch { }
+            }
+        }
+    }
+
+    return $instances
+}
+
+function Expand-DataModelBridge {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetDir,
+
+        [Parameter(Mandatory = $true)]
+        [byte[]]$DataModelBytes,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BaseName,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$IsDryRun = $false
+    )
+
+    $created = 0; $updated = 0; $skipped = 0; $errors = 0
+
+    # Header check
+    $isAbf = $false
+    $compression = "Unknown"
+    $headerDesc = ""
+    try {
+        $prefixLen = [Math]::Min($DataModelBytes.Length, 256)
+        $prefixStr = [System.Text.Encoding]::Unicode.GetString($DataModelBytes, 0, $prefixLen)
+        if ($prefixStr -match "backup" -or $prefixStr -match "xpress") {
+            $isAbf = $true
+            $headerDesc = $prefixStr.Trim()
+            if ($prefixStr -match "xpress9") { $compression = "XPress9" }
+            elseif ($prefixStr -match "xpress") { $compression = "XPress" }
+        }
+    } catch { }
+
+    $safeDbName = [System.Text.RegularExpressions.Regex]::Replace($BaseName, '[^\w\-_]', '_')
+    if ([string]::IsNullOrWhiteSpace($safeDbName)) { $safeDbName = "PowerBI_Model" }
+
+    $bridgeDir = [System.IO.Path]::Combine($TargetDir, "DataModel_Bridge")
+
+    # 1. Write DataModel.abf
+    try {
+        $abfRel = "DataModel_Bridge/DataModel.abf"
+        $destAbf = [System.IO.Path]::Combine($TargetDir, $abfRel)
+        $r1 = Write-DeltaFile -DestFilePath $destAbf -Bytes $DataModelBytes -RelPath $abfRel -IsDryRun $IsDryRun
+        $created += $r1.Created; $updated += $r1.Updated; $skipped += $r1.Skipped
+    } catch {
+        $errors++
+        Write-Host "  [SKIPPED - ERROR] Could not write DataModel.abf: $_" -ForegroundColor Red
+    }
+
+    # 2. Write Restore_Database.xmla
+    try {
+        $xmlaRel = "DataModel_Bridge/Restore_Database.xmla"
+        $destXmla = [System.IO.Path]::Combine($TargetDir, $xmlaRel)
+        $fullAbfPath = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($TargetDir, "DataModel_Bridge", "DataModel.abf"))
+        $xmlaContent = @"
+<Restore xmlns="http://schemas.microsoft.com/analysisservices/2003/engine">
+  <File>$fullAbfPath</File>
+  <DatabaseName>$safeDbName</DatabaseName>
+  <AllowOverwrite>true</AllowOverwrite>
+</Restore>
+"@
+        $r2 = Write-DeltaFile -DestFilePath $destXmla -Bytes ([System.Text.Encoding]::UTF8.GetBytes($xmlaContent)) -RelPath $xmlaRel -IsDryRun $IsDryRun
+        $created += $r2.Created; $updated += $r2.Updated; $skipped += $r2.Skipped
+    } catch {
+        $errors++
+        Write-Host "  [SKIPPED - ERROR] Could not write Restore_Database.xmla: $_" -ForegroundColor Red
+    }
+
+    # 3. Write DataModel_Info.json
+    try {
+        $infoRel = "DataModel_Bridge/DataModel_Info.json"
+        $destInfo = [System.IO.Path]::Combine($TargetDir, $infoRel)
+        $infoObj = [ordered]@{
+            file_name                   = "DataModel"
+            file_size_bytes             = $DataModelBytes.Length
+            is_analysis_services_backup = $isAbf
+            compression_type            = $compression
+            header_descriptor           = $headerDesc
+            recommended_workflows       = [ordered]@{
+                workflow_1_powerbi_live_connection = [ordered]@{
+                    description             = "Open the .pbix file in Power BI Desktop, locate msmdsrv.port.txt in AppData, and connect DAX Studio or Tabular Editor to localhost:<port>."
+                    powerbi_port_detection  = "Run Unpack-Pbix.ps1 with -FindActivePorts"
+                }
+                workflow_2_pbip_export             = [ordered]@{
+                    description = "In Power BI Desktop, click File -> Save As -> Power BI Project (.pbip). This extracts TMDL / model.bim into git-friendly text files."
+                }
+                workflow_3_ssas_restore            = [ordered]@{
+                    description          = "Restore DataModel.abf into a local SSAS Tabular instance using Restore_Database.xmla."
+                    target_database_name = $safeDbName
+                    restore_script       = "DataModel_Bridge/Restore_Database.xmla"
+                }
+            }
+        }
+        $infoJson = $infoObj | ConvertTo-Json -Depth 6
+        $r3 = Write-DeltaFile -DestFilePath $destInfo -Bytes ([System.Text.Encoding]::UTF8.GetBytes($infoJson)) -RelPath $infoRel -IsDryRun $IsDryRun
+        $created += $r3.Created; $updated += $r3.Updated; $skipped += $r3.Skipped
+    } catch {
+        $errors++
+        Write-Host "  [SKIPPED - ERROR] Could not write DataModel_Info.json: $_" -ForegroundColor Red
+    }
+
+    return [PSCustomObject]@{ Created = $created; Updated = $updated; Skipped = $skipped; Errors = $errors }
+}
+
 function Expand-PbixFile {
     param(
         [Parameter(Mandatory = $true)]
@@ -721,7 +868,10 @@ function Expand-PbixFile {
         [bool]$ParseSchema = $true,
 
         [Parameter(Mandatory = $false)]
-        [bool]$ParseReport = $true
+        [bool]$ParseReport = $true,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$ParseDataModel = $true
     )
 
     $parentDir = [System.IO.Path]::GetDirectoryName($PbixPath)
@@ -737,6 +887,7 @@ function Expand-PbixFile {
     $errors = 0
     $mashupBytes = $null
     $schemaBytes = $null
+    $datamodelBytes = $null
     $layoutBytes = $null
     $diagramBytes = $null
     $linguisticBytes = $null
@@ -783,6 +934,9 @@ function Expand-PbixFile {
                 }
                 elseif ($entryRelPath -eq "DataModelSchema" -or $entryRelPath -eq "DataModelSchema.json") {
                     $schemaBytes = $bytes
+                }
+                elseif ($entryRelPath -eq "DataModel") {
+                    $datamodelBytes = $bytes
                 }
                 elseif ($entryRelPath -eq "Report/Layout") {
                     $layoutBytes = $bytes
@@ -859,6 +1013,21 @@ function Expand-PbixFile {
         }
     }
 
+    # 4. DataModel VertiPaq ABF Bridge
+    if ($ParseDataModel) {
+        if ($null -ne $datamodelBytes) {
+            Write-Host "  -> Preparing DataModel VertiPaq ABF Bridge (XMLA Restore & Metadata)..." -ForegroundColor Cyan
+            $br = Expand-DataModelBridge -TargetDir $targetDir -DataModelBytes $datamodelBytes -BaseName $baseName -IsDryRun $IsDryRun
+            $created += $br.Created
+            $updated += $br.Updated
+            $skipped += $br.Skipped
+            $errors += $br.Errors
+        }
+        else {
+            Write-Host "  [NOTE] No raw DataModel entry in this file (e.g. .pbit template or live cloud dataset)." -ForegroundColor DarkGray
+        }
+    }
+
     $summaryLabel = if ($IsDryRun) { "Dry-run summary" } else { "Unpacked" }
     $errorMsg = if ($errors -gt 0) { ", $errors failed/skipped" } else { "" }
     Write-Host "  -> $summaryLabel : $created created, $updated updated, $skipped unchanged$errorMsg." -ForegroundColor Gray
@@ -869,6 +1038,29 @@ function Expand-PbixFile {
         Skipped = $skipped
         Errors  = $errors
     }
+}
+
+if ($FindActivePorts.IsPresent) {
+    Write-Host "`nSearching for active Power BI Desktop Analysis Services (SSAS) instances..." -ForegroundColor Cyan
+    $activeInstances = Get-PowerBiActiveSsasInstances
+    if ($activeInstances.Count -eq 0) {
+        Write-Host "  No active Power BI Desktop SSAS instances found (or running on non-Windows host without mounted AppData)." -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host "  Found $($activeInstances.Count) active instance(s):" -ForegroundColor Green
+        foreach ($inst in $activeInstances) {
+            Write-Host "    - Port: $($inst.Port)" -ForegroundColor Yellow
+            Write-Host "      Connection: $($inst.ConnectionString)"
+            Write-Host "      Workspace:  $($inst.WorkspaceDir)"
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        exit 0
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($Path)) {
+    throw "Parameter -Path is required when not querying active ports."
 }
 
 # Resolve and validate root path
@@ -922,7 +1114,7 @@ $totalSkipped = 0
 $totalErrors  = 0
 
 foreach ($file in $discoveredFiles) {
-    $res = Expand-PbixFile -PbixPath $file -IsDryRun $DryRun.IsPresent -ParseMashup (-not $NoMashup.IsPresent) -ParseSchema (-not $NoSchema.IsPresent) -ParseReport (-not $NoReport.IsPresent)
+    $res = Expand-PbixFile -PbixPath $file -IsDryRun $DryRun.IsPresent -ParseMashup (-not $NoMashup.IsPresent) -ParseSchema (-not $NoSchema.IsPresent) -ParseReport (-not $NoReport.IsPresent) -ParseDataModel (-not $NoDataModel.IsPresent)
     $totalCreated += $res.Created
     $totalUpdated += $res.Updated
     $totalSkipped += $res.Skipped
